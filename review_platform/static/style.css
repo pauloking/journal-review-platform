@@ -364,3 +364,13 @@ th { background: #f8fafc; color: var(--muted); }
 .chk-label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; }
 .llm-dims-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 4px; }
 .llm-dims-list { display: flex; flex-wrap: wrap; gap: 12px; }
+.auth-bar { display: flex; align-items: center; gap: 6px; }
+.auth-bar input {
+  padding: 5px 9px;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  background: #1e293b;
+  color: #fff;
+  font-size: 12px;
+  width: 190px;
+}

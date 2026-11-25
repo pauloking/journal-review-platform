@@ -170,3 +170,158 @@ def test_llm_semantic_review_with_anchor_gate_and_key_isolation(tmp_path: Path):
     assert "sk-never-persist-this-secret" not in json.dumps(run)
     stored_raw = client.get(f"/reviews/{run['run_id']}").text
     assert "sk-never-persist-this-secret" not in stored_raw
+
+
+def test_n2_server_api_key_isolated_from_custom_endpoint(tmp_path: Path, monkeypatch):
+    """N2 回归：服务端 REVIEW_LLM_API_KEY 严禁发送至用户自定义的非同源 endpoint。"""
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "sk-SERVER-SECRET-NEVER-LEAK")
+    monkeypatch.setenv("REVIEW_LLM_ENDPOINT", "https://api.openai.com/v1")
+
+    captured: list[dict] = []
+    factory = _mock_client_factory(captured, lambda r, b: (200, {"choices": [{"message": {"content": "ok"}}]}))
+    client = TestClient(create_app(db_path=tmp_path / "n2.sqlite3", llm_client_factory=factory))
+
+    # 用户指定第三方自定义 endpoint 但未传 api_key：不得回落使用服务端 key
+    res = client.post(
+        "/llm/test",
+        json={
+            "enabled": True,
+            "provider": "custom",
+            "endpoint": "https://attacker.example.com/v1",
+            "api_key": "",
+            "model": "gpt-4o-mini",
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["ok"] is False
+    assert captured == []
+    assert "sk-SERVER-SECRET-NEVER-LEAK" not in json.dumps(data)
+
+
+def test_n3_ssrf_targets_blocked_and_upstream_body_sanitized(tmp_path: Path):
+    """N3 回归：阻断元数据/回环/带查询参数的 SSRF 地址，且不回显上游原始错误体。"""
+    captured: list[dict] = []
+
+    def _err_resp(req: httpx.Request, body: dict):
+        return 500, {"error": {"message": "SECRET_INTERNAL_STACK_TRACE_LEAK", "code": "upstream_err"}}
+
+    factory = _mock_client_factory(captured, _err_resp)
+    client = TestClient(create_app(db_path=tmp_path / "n3.sqlite3", llm_client_factory=factory))
+
+    for bad_ep in [
+        "http://169.254.169.254/latest/meta-data",
+        "http://127.0.0.1:8080/v1",
+        "https://api.deepseek.com/v1?leak=1",
+        "https://api.deepseek.com/v1#frag",
+    ]:
+        r = client.post(
+            "/llm/test",
+            json={
+                "enabled": True,
+                "provider": "custom",
+                "endpoint": bad_ep,
+                "api_key": "sk-user",
+                "model": "deepseek-chat",
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["ok"] is False
+    assert captured == []
+
+    # 合法公网地址返回上游 500 时，仅摘要状态码与错误码，不泄露内部堆栈文本
+    r_err = client.post(
+        "/llm/test",
+        json={
+            "enabled": True,
+            "provider": "custom",
+            "endpoint": "https://api.deepseek.com",
+            "api_key": "sk-user",
+            "model": "deepseek-chat",
+        },
+    )
+    assert r_err.status_code == 200
+    err_data = r_err.json()
+    assert err_data["ok"] is False
+    assert "500" in err_data["message"]
+    assert "SECRET_INTERNAL_STACK_TRACE_LEAK" not in err_data["message"]
+
+
+def test_n4_and_i3_run_seed_includes_llm_dims_and_truncation_disclosure(tmp_path: Path):
+    """N4 & i3 回归：不同 enabled_rules/temperature 生成不同 run_id；超过 24,000 字时显式披露截断并降级状态。"""
+    captured: list[dict] = []
+
+    def _resp(req: httpx.Request, body: dict):
+        return 200, {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "findings": [
+                                    {
+                                        "blockId": "P0002",
+                                        "originalText": "观察组纳入50例",
+                                        "description": "语境示例",
+                                        "suggestion": "保持一致",
+                                        "reason": "语义检查",
+                                        "severity": "info",
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+
+    factory = _mock_client_factory(captured, _resp)
+    client = TestClient(create_app(db_path=tmp_path / "n4_i3.sqlite3", llm_client_factory=factory))
+
+    long_para = "观察组纳入50例患者并进行常规治疗与统计学评估。" * 700  # > 17,000 chars
+    raw = make_docx_bytes(["长稿截断与幂等键测试", "摘要：观察组纳入50例。", "1 方法", long_para, long_para])
+    files = {"file": ("long.docx", raw, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")}
+
+    r1 = client.post(
+        "/reviews?journal=general-medical-cn",
+        data={
+            "llm_config": json.dumps(
+                {
+                    "enabled": True,
+                    "provider": "openai",
+                    "api_key": "sk-k1",
+                    "model": "gpt-4o-mini",
+                    "enabled_rules": ["AI-LANGUAGE-STYLE"],
+                    "temperature": 0.1,
+                }
+            )
+        },
+        files=files,
+    ).json()
+
+    r2 = client.post(
+        "/reviews?journal=general-medical-cn",
+        data={
+            "llm_config": json.dumps(
+                {
+                    "enabled": True,
+                    "provider": "openai",
+                    "api_key": "sk-k1",
+                    "model": "gpt-4o-mini",
+                    "enabled_rules": ["AI-METHOD-DESIGN"],
+                    "temperature": 0.5,
+                }
+            )
+        },
+        files=files,
+    ).json()
+
+    # N4: 不同 AI 维度或采样参数必须产出不同 run_id
+    assert r1["run_id"] != r2["run_id"]
+
+    # i3: 超 24k 字稿件须在 limitations 披露并标记 complete_with_limitations
+    assert r1["status"] == "complete_with_limitations"
+    assert any("24,000" in msg or "截断" in msg for msg in r1["document"]["limitations"])
+    ai_done = [t for t in r1["plan"]["tasks"] if t["node_id"] == "AI-LANGUAGE-STYLE"][0]
+    assert "context_truncated_24k" in ai_done["reason"]

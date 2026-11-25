@@ -1,24 +1,29 @@
-"""版本化规则注册、知识依据绑定与正反例自动校验。"""
+"""版本化规则注册、知识依据绑定、ReDoS 安全守卫与正反例自动校验。"""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import re
 from pathlib import Path
 from typing import Optional
 
-from review_platform.adapters.legacy_structure import _is_reference_entry
+import regex
+
+from review_platform.document_engine.text_utils import is_reference_entry
 from review_platform.knowledge_engine import KnowledgeEngine
 from review_platform.models import MaintainableTermRule, RuleSpec, ScopeType
 
 MAX_USER_REGEX_LEN = 500
-# 静态识别常见 ReDoS 灾难性回溯结构：嵌套量词、重叠分支加量词等
-_NESTED_QUANTIFIER_RE = re.compile(
-    r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*(?:[+*?]|\{\d+,\d*\})"
+MAX_RULE_EXAMPLE_LEN = 500
+REGEX_MATCH_TIMEOUT_SEC = 0.2
+
+# N1 修复：覆盖 + / * / ? / {m,n} / {m,} 等全部重复量词的嵌套与重叠分支结构
+_QUANT = r"(?:[+*?]|\{\s*\d+\s*(?:,\s*\d*\s*)?\})"
+_NESTED_QUANTIFIER_RE = regex.compile(
+    rf"\((?:[^()\\]|\\.)*{_QUANT}(?:[^()\\]|\\.)*\)\s*{_QUANT}"
 )
-_OVERLAPPING_ALT_QUANT_RE = re.compile(
-    r"\((?:[^()\\|]|\\.)*\|(?:[^()\\|]|\\.)*\)\s*(?:[+*]|\{\d+,\d*\})"
+_OVERLAPPING_ALT_QUANT_RE = regex.compile(
+    rf"\((?:[^()\\|]|\\.)*\|(?:[^()\\|]|\\.)*\)\s*{_QUANT}"
 )
 
 DEFAULT_RULES_DIR = (
@@ -51,67 +56,104 @@ def category_for_basis(basis_id: str, fallback: str = "terminology") -> str:
 
 
 def check_regex_safety(pattern: str) -> None:
-    """静态校验用户自定义正则，拦截嵌套量词与高风险灾难性回溯结构（ReDoS 防护）。"""
+    """静态校验用户自定义正则，拦截嵌套量词（含 {n,}）与带量词分支结构（ReDoS 防护）。"""
     if len(pattern) > MAX_USER_REGEX_LEN:
         raise ValueError(f"正则表达式过长（{len(pattern)} > {MAX_USER_REGEX_LEN}），已拒绝")
     if _NESTED_QUANTIFIER_RE.search(pattern):
-        raise ValueError("检测到高危嵌套量词正则结构（如 (a+)+），存在 ReDoS 风险，已拒绝")
+        raise ValueError("检测到高危嵌套量词正则结构（如 (a+)+ 或 (a{1,}){1,}），存在 ReDoS 风险，已拒绝")
     if _OVERLAPPING_ALT_QUANT_RE.search(pattern):
-        # 检查多分支加量词时是否存在共享首字符或通配风险
         raise ValueError("检测到带重复量词的分组分支结构 (a|b)+，为防 ReDoS 请改写或拆分为字面规则")
 
 
+def _validate_advanced_params(rule: MaintainableTermRule, *, is_builtin_trusted: bool) -> dict:
+    """N6 修复：强校验 advanced_params 全部字段类型与 exclude_pattern 正则合法性。"""
+    adv = rule.advanced_params or {}
+    if not isinstance(adv, dict):
+        raise ValueError(f"规则 {rule.rule_id} 的 advanced_params 必须为对象")
+
+    excl_pat = adv.get("exclude_pattern")
+    if excl_pat is not None:
+        if not isinstance(excl_pat, str):
+            raise ValueError(f"规则 {rule.rule_id} 的 exclude_pattern 必须为字符串")
+        if excl_pat.strip():
+            if not is_builtin_trusted:
+                check_regex_safety(excl_pat)
+            try:
+                regex.compile(excl_pat)
+            except regex.error as exc:
+                raise ValueError(f"规则 {rule.rule_id} 的 exclude_pattern 正则语法错误: {exc}") from exc
+
+    skip_ctx = adv.get("skip_context")
+    if skip_ctx is not None:
+        if not isinstance(skip_ctx, list) or not all(isinstance(x, str) for x in skip_ctx):
+            raise ValueError(f"规则 {rule.rule_id} 的 skip_context 必须为字符串列表")
+
+    for bool_key in ("whole_line", "ref_only", "skip_if_year", "auto"):
+        if bool_key in adv and not isinstance(adv[bool_key], bool):
+            raise ValueError(f"规则 {rule.rule_id} 的 {bool_key} 必须为布尔值")
+
+    if "dedupe_key" in adv and not isinstance(adv["dedupe_key"], str):
+        raise ValueError(f"规则 {rule.rule_id} 的 dedupe_key 必须为字符串")
+
+    return adv
+
+
 def validate_maintainable_rule(rule: MaintainableTermRule, *, is_builtin_trusted: bool = False) -> None:
-    """对可维护规则条目执行安全性与正反例门禁校验，严禁未经验证的规则进入正式注册表。"""
+    """对可维护规则条目执行安全性、参数类型与正反例门禁校验（带 C 级正则超时防护）。"""
+    adv = _validate_advanced_params(rule, is_builtin_trusted=is_builtin_trusted)
     pattern = rule.nonstandard.strip()
     if not pattern:
         return
+
+    if len(rule.example) > MAX_RULE_EXAMPLE_LEN or len(rule.counter_example) > MAX_RULE_EXAMPLE_LEN:
+        raise ValueError(f"规则 {rule.rule_id} 的正反例长度不能超过 {MAX_RULE_EXAMPLE_LEN} 字符")
 
     if rule.is_regex and not is_builtin_trusted:
         check_regex_safety(pattern)
 
     try:
-        compiled = re.compile(pattern) if rule.is_regex else re.compile(re.escape(pattern))
-    except re.error as exc:
+        compiled = regex.compile(pattern) if rule.is_regex else regex.compile(regex.escape(pattern))
+    except regex.error as exc:
         raise ValueError(f"规则 {rule.rule_id} 正则表达式语法错误: {exc}") from exc
 
     if not rule.example.strip():
         raise ValueError(f"规则 {rule.rule_id} 必须提供至少 1 个正例（example）用于验证")
 
-    adv = rule.advanced_params or {}
     excl_pat = adv.get("exclude_pattern")
+    excl_compiled = regex.compile(excl_pat) if excl_pat else None
     whole_line = bool(adv.get("whole_line", False))
     ref_only = bool(adv.get("ref_only", False))
     skip_if_year = bool(adv.get("skip_if_year", False))
     skip_context = adv.get("skip_context") or []
 
     def _matches(text: str) -> bool:
-        if ref_only and not _is_reference_entry(text):
-            return False
-        if whole_line:
-            if excl_pat and re.search(excl_pat, text):
+        try:
+            if ref_only and not is_reference_entry(text):
                 return False
-            return bool(text.strip())
-        if excl_pat and re.search(excl_pat, text):
-            return False
-        for m in compiled.finditer(text):
-            start, end = m.start(), m.end()
-            if skip_if_year and m.lastindex and m.lastindex >= 2:
-                try:
-                    lv, rv = int(float(m.group(1))), int(float(m.group(2)))
-                    if 1900 <= lv <= 2099 and 1900 <= rv <= 2099:
+            if excl_compiled and excl_compiled.search(text, timeout=REGEX_MATCH_TIMEOUT_SEC):
+                return False
+            if whole_line:
+                return bool(text.strip())
+            for m in compiled.finditer(text, timeout=REGEX_MATCH_TIMEOUT_SEC):
+                start, end = m.start(), m.end()
+                if skip_if_year and m.lastindex and m.lastindex >= 2:
+                    try:
+                        lv, rv = int(float(m.group(1))), int(float(m.group(2)))
+                        if 1900 <= lv <= 2099 and 1900 <= rv <= 2099:
+                            continue
+                    except ValueError:
+                        pass
+                if skip_context and start > 0:
+                    prev_char = text[max(0, start - 3) : start]
+                    if any(ctx in prev_char for ctx in skip_context):
                         continue
-                except ValueError:
-                    pass
-            if skip_context and start > 0:
-                prev_char = text[max(0, start - 3) : start]
-                if any(ctx in prev_char for ctx in skip_context):
+                after = text[end : end + 4]
+                if any(after.startswith(exc) for exc in rule.exception_after):
                     continue
-            after = text[end : end + 4]
-            if any(after.startswith(exc) for exc in rule.exception_after):
-                continue
-            return True
-        return False
+                return True
+            return False
+        except TimeoutError as exc:
+            raise ValueError(f"规则 {rule.rule_id} 正则匹配超时（疑似 ReDoS），已拒绝") from exc
 
     if not _matches(rule.example):
         raise ValueError(
@@ -395,11 +437,11 @@ class RuleRegistry:
         self._rules[rule.id] = rule
 
     def replace_rules_for_basis(self, basis_id: str, new_rules: list[RuleSpec]) -> None:
-        """原子替换某一规范依据对应的可编辑规则集合（保留 fact_validator 内置规则）。"""
+        """原子替换某一规范依据对应的可编辑规则集合（保留 fact_validator / ai_candidate 内置规则）。"""
         to_delete = [
             rid
             for rid, r in self._rules.items()
-            if r.basis_id == basis_id and r.executor_type != "fact_validator"
+            if r.basis_id == basis_id and r.executor_type not in {"fact_validator", "ai_candidate"}
         ]
         for rid in to_delete:
             del self._rules[rid]

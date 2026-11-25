@@ -20,9 +20,9 @@
 3. **边界 (Boundary)**：如 `P=0` / `P=1`、四舍五入容差边界、`2020-2025` 年份豁免；
 4. **例外 (Exception)**：如引号内示例句、“血压高于”“人流量”上下文豁免、正文提及“见图9”不误判为题注。
 
-## 3. 历史回归与当前实测基线（2026-11-25）
+## 3. 历史回归与当前实测基线（2026-11-26）
 
-- **本平台自动化测试（`.venv/bin/python -m pytest -v`，Python 3.12.13）**：覆盖 `DocumentIR` 安全解析与锚点、Knowledge/Registry/Router DAG、P 值/百分比/题注/复用规则正反边界例外、规则文档无损往返与重启保持、ReDoS 静态与执行预算拦截、流式上传限额与 ZIP 炸弹拦截、Bearer RBAC 鉴权、同段多批注 Word 导出、受控大模型（OpenAI/Claude/自定义兼容接口）并行执行与锚点/幻觉拦截门禁、乐观并发裁决、综合报告导出及 CLI 全流程（最新实测见下一次运行记录）。
+- **本平台自动化测试（`.venv/bin/python -m pytest -v`，Python 3.12.13）**：实测 **31/31 全部通过**，覆盖 `DocumentIR` 安全解析与锚点、Knowledge/Registry/Router DAG、P 值/百分比/题注/复用规则正反边界例外、规则文档无损往返与重启保持、ReDoS 花括号量词与 `regex` 超时熔断、`advanced_params` 校验、流式上传限额与 ZIP 炸弹拦截、Bearer RBAC 鉴权与前端会话令牌栏、同段多批注 Word 导出、受控大模型（OpenAI/Claude/自定义兼容接口）并行执行与锚点/幻觉拦截门禁、服务端密钥同源隔离、SSRF 阻断与错误脱敏、LLM 维度幂等键与长稿 24,000 字截断降级披露、乐观并发裁决、综合报告导出及 CLI 全流程。
 - **历史基线核对（未改动原仓库）**：
   - `medical-journal-copyediting-2.0.0`：`scripts/tests/run_tests.py` 实测 `25/25` 通过（`F1=1.000`）。
   - `medical-journal-reviewer`：`npm test`（Vitest）实测 9 个文件 `95/95` 通过，`npm run build` 构建通过。

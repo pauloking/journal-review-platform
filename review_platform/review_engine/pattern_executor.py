@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import time
 from typing import Any
 
-RULE_EXEC_BUDGET_MS = 250.0
+import regex
 
-from review_platform.adapters.legacy_structure import _is_reference_entry
+from review_platform.document_engine.text_utils import is_reference_entry as _is_reference_entry
 from review_platform.models import (
     Anchor,
     AnchorVerification,
@@ -19,6 +18,9 @@ from review_platform.models import (
     JournalProfile,
     RuleSpec,
 )
+
+RULE_EXEC_BUDGET_MS = 250.0
+REGEX_MATCH_TIMEOUT_SEC = 0.2
 
 
 def _in_excluded_span(block: Block, start: int, end: int) -> bool:
@@ -88,7 +90,7 @@ def _should_skip_match(
 
     # exclude_pattern（整段含排除模式则跳过，如 STA-METHOD 已含检验方法名）
     excl_pat = params.get("exclude_pattern")
-    if excl_pat and re.search(excl_pat, line_text):
+    if excl_pat and regex.search(excl_pat, line_text, timeout=REGEX_MATCH_TIMEOUT_SEC):
         return "exclude_pattern_matched"
 
     # NUM-LEADZERO 额外保护：避免把 "第1.2节" 或 "1.2.3" 或小数后版本误判
@@ -122,7 +124,7 @@ def execute_pattern_rule(
     whole_line = bool(params.get("whole_line", False))
     applies_to = set(rule.applies_to) if rule.applies_to else None
 
-    compiled = re.compile(pattern) if is_regex else re.compile(re.escape(pattern))
+    compiled = regex.compile(pattern) if is_regex else regex.compile(regex.escape(pattern))
     t_start = time.perf_counter()
     findings: list[Finding] = []
     checked = 0
@@ -150,7 +152,7 @@ def execute_pattern_rule(
                 excluded += 1
                 continue
             excl_pat = params.get("exclude_pattern")
-            if excl_pat and re.search(excl_pat, text):
+            if excl_pat and regex.search(excl_pat, text, timeout=REGEX_MATCH_TIMEOUT_SEC):
                 continue
             if not text.strip():
                 continue
@@ -172,7 +174,7 @@ def execute_pattern_rule(
             )
             continue
 
-        for m in compiled.finditer(text):
+        for m in compiled.finditer(text, timeout=REGEX_MATCH_TIMEOUT_SEC):
             checked += 1
             reason = _should_skip_match(rule, block, m, text)
             if reason:

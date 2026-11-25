@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import ipaddress
 import json
 import os
 import re
+import socket
 import time
 from typing import Any, Callable, Optional, Protocol
 from urllib.parse import urlparse
@@ -90,7 +92,7 @@ def get_llm_env_defaults_public() -> dict[str, Any]:
 
 
 def resolve_llm_config(user_cfg: Optional[LLMConfig]) -> LLMConfig:
-    """合并用户提交配置与可选服务端环境变量默认配置。"""
+    """合并用户提交配置与可选服务端环境变量默认配置（严格同源隔离：自定义地址绝不复用服务端密钥）。"""
     if user_cfg is None:
         env_enabled = os.environ.get("REVIEW_LLM_ENABLED", "").strip().lower() in ("1", "true", "yes")
         if not env_enabled:
@@ -101,9 +103,25 @@ def resolve_llm_config(user_cfg: Optional[LLMConfig]) -> LLMConfig:
         return user_cfg
 
     provider = user_cfg.provider
-    endpoint = user_cfg.endpoint.strip() or os.environ.get("REVIEW_LLM_ENDPOINT", "").strip()
+    user_endpoint = user_cfg.endpoint.strip()
+    env_endpoint = os.environ.get("REVIEW_LLM_ENDPOINT", "").strip()
+    endpoint = user_endpoint or env_endpoint
     model = user_cfg.model.strip() or os.environ.get("REVIEW_LLM_MODEL", "").strip() or DEFAULT_MODELS[provider]
-    api_key = user_cfg.api_key.strip() or os.environ.get("REVIEW_LLM_API_KEY", "").strip()
+
+    # N2 修复：仅当 endpoint 未被用户自定义替换（即仍为服务端默认或官方默认）时，才允许回退服务端环境变量密钥
+    official_default = DEFAULT_ENDPOINTS.get(provider, "")
+    same_origin_as_server = (
+        not user_endpoint
+        or (env_endpoint and user_endpoint.rstrip("/") == env_endpoint.rstrip("/"))
+        or (official_default and user_endpoint.rstrip("/") == official_default.rstrip("/"))
+    )
+    user_key = user_cfg.api_key.strip()
+    if user_key:
+        api_key = user_key
+    elif same_origin_as_server:
+        api_key = os.environ.get("REVIEW_LLM_API_KEY", "").strip()
+    else:
+        api_key = ""
 
     return user_cfg.model_copy(
         update={
@@ -297,6 +315,57 @@ def parse_model_json(response: str) -> dict[str, Any]:
     raise ValueError("模型返回的 JSON 无法解析与修复")
 
 
+def _is_disallowed_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    )
+
+
+def _validate_ssrf_target(endpoint: str) -> None:
+    """N3 修复：拒绝内网/环回/链路本地（云元数据）地址及 query/fragment 注入。"""
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or not parsed.hostname:
+        raise ValueError("接口地址必须为合法的 http:// 或 https:// URL")
+    if parsed.query or parsed.fragment:
+        raise ValueError("接口地址不允许包含查询参数 (?) 或锚点 (#)")
+
+    allow_local = os.environ.get("REVIEW_LLM_ALLOW_LOCAL", "").strip().lower() in ("1", "true", "yes")
+    if allow_local:
+        return
+
+    host = parsed.hostname.lower()
+    if host in ("localhost", "ip6-localhost") or host.endswith((".local", ".internal")):
+        raise ValueError("默认禁止访问本机或内网域名（如需本机 Ollama 请设置 REVIEW_LLM_ALLOW_LOCAL=1）")
+
+    try:
+        ip_lit = ipaddress.ip_address(host)
+    except ValueError:
+        ip_lit = None
+
+    if ip_lit is not None:
+        if _is_disallowed_ip(ip_lit):
+            raise ValueError("默认禁止访问私有网段、环回或链路本地地址（SSRF 防护）")
+        return
+
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        for info in infos:
+            sockaddr = info[4]
+            if sockaddr:
+                resolved_ip = ipaddress.ip_address(sockaddr[0].split("%")[0])
+                if _is_disallowed_ip(resolved_ip):
+                    raise ValueError("目标域名解析到受限内网或链路本地地址（SSRF 防护）")
+    except socket.gaierror:
+        # 离线/测试环境允许继续交给传输层或 MockTransport 处理
+        pass
+
+
 def _resolve_endpoint(config: LLMConfig) -> str:
     raw = config.endpoint.strip()
     if config.provider == "openai":
@@ -306,13 +375,14 @@ def _resolve_endpoint(config: LLMConfig) -> str:
     else:
         if not raw:
             raise ValueError("自定义接口必须提供 Base URL / Endpoint")
+        parsed_raw = urlparse(raw)
+        if parsed_raw.query or parsed_raw.fragment:
+            raise ValueError("自定义接口地址不允许包含查询参数 (?) 或锚点 (#)")
         ep = raw.rstrip("/")
         if not (ep.endswith("/v1/chat/completions") or ep.endswith("/chat/completions")):
             ep = f"{ep}/chat/completions" if ep.endswith("/v1") else f"{ep}/v1/chat/completions"
 
-    parsed = urlparse(ep)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError("接口地址必须为合法的 http:// 或 https:// URL")
+    _validate_ssrf_target(ep)
     return ep
 
 
@@ -338,7 +408,7 @@ def call_llm_completion(
         raise ValueError("请提供有效的 API Key")
 
     max_tokens = max_tokens_override or config.max_tokens
-    make_client = client_factory or (lambda t: httpx.Client(timeout=t))
+    make_client = client_factory or (lambda t: httpx.Client(timeout=t, follow_redirects=False))
 
     with make_client(config.timeout_seconds) as client:
         if config.provider == "claude":
@@ -373,13 +443,16 @@ def call_llm_completion(
             resp = client.post(endpoint, headers=headers, json=payload)
 
     if resp.status_code >= 400:
-        detail = ""
+        # N3 修复：脱敏错误提示，不回显任意上游原始响应体，防止半盲 SSRF 读取
+        err_code = ""
         try:
             err_json = resp.json()
-            detail = err_json.get("error", {}).get("message") or err_json.get("message") or ""
+            if isinstance(err_json, dict) and isinstance(err_json.get("error"), dict):
+                err_code = str(err_json["error"].get("code") or err_json["error"].get("type") or "")[:40]
         except Exception:
-            detail = resp.text[:180]
-        raise RuntimeError(f"大模型接口错误 ({resp.status_code}): {detail or resp.reason_phrase}")
+            pass
+        suffix = f" [{err_code}]" if err_code else ""
+        raise RuntimeError(f"大模型接口返回错误（HTTP {resp.status_code}{suffix}）")
 
     data = resp.json()
     if config.provider == "claude":
@@ -498,8 +571,9 @@ def run_semantic_rule_with_llm(
 
     manuscript_lines = [f"[{b.id} | {b.section_cn}] {b.text}" for b in target_blocks]
     manuscript_text = "\n".join(manuscript_lines)
-    # 防止超长稿件撑爆单次上下文，保守截断到约 24000 字符并明确提示
-    if len(manuscript_text) > 24000:
+    context_truncated = len(manuscript_text) > 24000
+    # 防止超长稿件撑爆单次上下文，保守截断到约 24000 字符并显式标记
+    if context_truncated:
         manuscript_text = manuscript_text[:24000] + "\n…（后续内容超出单次模型上下文预算已截断）"
 
     dimension_guide = RULE_INSTRUCTIONS.get(rule.id, rule.message_template)
@@ -582,6 +656,7 @@ def run_semantic_rule_with_llm(
                     "model": config.model,
                     "reason": str(item.get("reason") or "").strip(),
                     "block_hint": block_hint,
+                    "context_truncated": context_truncated,
                 },
                 source_type="ai_candidate",
                 verification=AnchorVerification(anchor_valid=False, basis_valid=False, reason="pending"),

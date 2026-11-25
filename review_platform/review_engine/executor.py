@@ -415,15 +415,19 @@ def execute_plan(
                     t.excluded_count = exc
                     t.finding_count = len(f_list)
                     t.status = "findings" if f_list else "passed"
+                    trunc_note = ""
+                    if any(bool(f.evidence.get("context_truncated")) for f in f_list) or sum(len(b.text) for b in document.blocks) > 24000:
+                        trunc_note = ", context_truncated_24k"
                     t.reason = (
-                        f"ai_findings:{len(f_list)} ({resolved_llm.provider}/{resolved_llm.model})"
+                        f"ai_findings:{len(f_list)} ({resolved_llm.provider}/{resolved_llm.model}{trunc_note})"
                         if f_list
-                        else f"ai_checked_ok ({resolved_llm.provider}/{resolved_llm.model})"
+                        else f"ai_checked_ok ({resolved_llm.provider}/{resolved_llm.model}{trunc_note})"
                     )
                 except Exception as exc:
                     has_failure = True
                     t.status = "failed"
                     t.reason = f"error:{exc}"
+                task_status[t.node_id] = t.status
                 updated_tasks[idx] = t
 
     final_plan = plan.model_copy(update={"tasks": updated_tasks})

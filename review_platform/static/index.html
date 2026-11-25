@@ -12,6 +12,10 @@
       <h1>中文科技期刊智能审校能力平台</h1>
       <span class="badge" id="version-badge">V0.1</span>
     </div>
+    <div id="auth-bar" class="auth-bar hidden">
+      <input id="api-token-input" type="password" placeholder="输入 Bearer 访问令牌..." autocomplete="off" />
+      <button id="save-token-btn" type="button" class="btn small primary">设置令牌</button>
+    </div>
     <nav class="tabs">
       <button class="tab active" data-tab="workbench">审校工作台</button>
       <button class="tab" data-tab="registry">规则库与知识依据</button>
@@ -44,7 +48,7 @@
             <strong>智能大模型审校配置（可选 · 用户自定义 API）</strong>
             <span id="llm-status-pill" class="pill-skip">未启用（仅确定性规则）</span>
           </div>
-          <span class="hint">配置保存在当前浏览器，API Key 绝不入库</span>
+          <span class="hint">配置仅保存在当前标签页会话（关闭即清除），API Key 绝不入库</span>
         </summary>
         <div class="llm-body">
           <div class="llm-toggle-row">

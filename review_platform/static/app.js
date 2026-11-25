@@ -79,9 +79,26 @@ function showBanner(msg, isError = false) {
   el.className = isError ? 'banner error' : 'banner';
 }
 
+const AUTH_TOKEN_KEY = 'jrp_api_token_v1';
+
+async function apiFetch(url, options = {}) {
+  const token = (sessionStorage.getItem(AUTH_TOKEN_KEY) || '').trim();
+  const headers = new Headers(options.headers || {});
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  const res = await fetch(url, { ...options, headers });
+  if (res.status === 401) {
+    const authBar = document.getElementById('auth-bar');
+    if (authBar) authBar.classList.remove('hidden');
+    showBanner('服务已启用访问鉴权，请在顶部输入有效 Bearer 令牌后点击“设置令牌”。', true);
+  }
+  return res;
+}
+
 async function refreshRegistry() {
   try {
-    const regRes = await fetch('/registry');
+    const regRes = await apiFetch('/registry');
     if (!regRes.ok) throw new Error(`HTTP ${regRes.status}`);
     const reg = await regRes.json();
     registryData = reg;
@@ -110,6 +127,32 @@ async function init() {
       if (btn.dataset.tab === 'evaluation') loadEvaluation();
     });
   });
+
+  document.getElementById('save-token-btn')?.addEventListener('click', async () => {
+    const val = (document.getElementById('api-token-input')?.value || '').trim();
+    if (val) {
+      sessionStorage.setItem(AUTH_TOKEN_KEY, val);
+    } else {
+      sessionStorage.removeItem(AUTH_TOKEN_KEY);
+    }
+    showBanner(val ? '访问令牌已保存至当前会话，正在重新加载数据...' : '已清除会话访问令牌');
+    await refreshRegistry();
+    await initLlmConfigPanel();
+  });
+
+  try {
+    const hRes = await fetch('/health');
+    if (hRes.ok) {
+      const h = await hRes.json();
+      if (h.auth_enabled) {
+        document.getElementById('auth-bar')?.classList.remove('hidden');
+        const tokInput = document.getElementById('api-token-input');
+        if (tokInput) tokInput.value = sessionStorage.getItem(AUTH_TOKEN_KEY) || '';
+      }
+    }
+  } catch {
+    // 非阻断
+  }
 
   await refreshRegistry();
   await initLlmConfigPanel();
@@ -157,7 +200,7 @@ async function handleRuleDocUpload(ev) {
   fd.append('file', file);
   showBanner(`正在解析规范文档「${file.name}」...`);
   try {
-    const res = await fetch('/knowledge/documents/parse', { method: 'POST', body: fd });
+    const res = await apiFetch('/knowledge/documents/parse', { method: 'POST', body: fd });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       showBanner(data.detail || '规则文档解析失败', true);
@@ -182,13 +225,13 @@ let llmAiRules = [];
 
 async function initLlmConfigPanel() {
   try {
-    const res = await fetch('/llm/defaults');
+    const res = await apiFetch('/llm/defaults');
     const defs = res.ok ? await res.json() : { ai_rules: [] };
     llmAiRules = defs.ai_rules || [];
 
     let saved = {};
     try {
-      saved = JSON.parse(localStorage.getItem(LLM_STORAGE_KEY) || '{}');
+      saved = JSON.parse(sessionStorage.getItem(LLM_STORAGE_KEY) || '{}');
     } catch {
       saved = {};
     }
@@ -243,10 +286,10 @@ function updateLlmStatusPill() {
 
 function saveLlmConfigLocal() {
   const cfg = collectLlmConfig();
-  localStorage.setItem(LLM_STORAGE_KEY, JSON.stringify(cfg));
+  sessionStorage.setItem(LLM_STORAGE_KEY, JSON.stringify(cfg));
   updateLlmStatusPill();
   const resEl = document.getElementById('llm-test-result');
-  resEl.textContent = '已保存至当前浏览器本地存储（API Key 不上传落库）。';
+  resEl.textContent = '已保存至当前标签页会话存储（关闭标签页自动清除，API Key 不入库）。';
 }
 
 async function testLlmConnectionUi() {
@@ -254,7 +297,7 @@ async function testLlmConnectionUi() {
   const resEl = document.getElementById('llm-test-result');
   resEl.textContent = '正在测试模型连接...';
   try {
-    const res = await fetch('/llm/test', {
+    const res = await apiFetch('/llm/test', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...cfg, enabled: true }),
@@ -284,7 +327,7 @@ async function runReview() {
   const fd = new FormData();
   fd.append('file', file);
   const llmCfg = collectLlmConfig();
-  localStorage.setItem(LLM_STORAGE_KEY, JSON.stringify(llmCfg));
+  sessionStorage.setItem(LLM_STORAGE_KEY, JSON.stringify(llmCfg));
   if (llmCfg.enabled) {
     fd.append('llm_config', JSON.stringify(llmCfg));
   }
@@ -293,7 +336,7 @@ async function runReview() {
   renderRunningPlaceholder();
 
   try {
-    const res = await fetch(`/reviews?journal=${encodeURIComponent(journal)}`, { method: 'POST', body: fd });
+    const res = await apiFetch(`/reviews?journal=${encodeURIComponent(journal)}`, { method: 'POST', body: fd });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       showBanner(data.detail || '审校执行失败', true);
@@ -311,7 +354,7 @@ async function runReview() {
 
 async function loadRunById(runId) {
   try {
-    const res = await fetch(`/reviews/${encodeURIComponent(runId)}`);
+    const res = await apiFetch(`/reviews/${encodeURIComponent(runId)}`);
     if (!res.ok) {
       showBanner('未能加载指定 run_id', true);
       return;
@@ -349,7 +392,7 @@ function renderRun() {
   document.getElementById('m-doc-stats').textContent = `${p.total_blocks} 块 / ${p.char_count} 字`;
   document.getElementById('m-task-stats').textContent = `${currentRun.plan.tasks.length} 任务`;
   document.getElementById('m-finding-stats').textContent = `${currentRun.findings.length} 条`;
-  document.getElementById('doc-profile-tag').textContent = `结构状态: ${p.structure_status}`;
+  document.getElementById('doc-profile-tag').textContent = `结构状态: ${p.structure_status} · 运行状态: ${currentRun.status}`;
 
   renderPipelineVisualization();
   renderDocumentBlocks();
@@ -499,7 +542,12 @@ function renderFindings() {
 
   const excludedFacts = (currentRun.facts || []).filter((f) => f.status === 'excluded');
   const rejectedCands = currentRun.rejected_candidates || [];
+  const limitations = currentRun.document?.limitations || [];
+  const aiTruncLim = limitations.filter((l) => l.includes('AI') || l.includes('截断'));
   let excludedNotice = '';
+  if (aiTruncLim.length) {
+    excludedNotice += `<div class="banner error" style="margin-bottom:8px;">长稿截断提示：${esc(aiTruncLim.join('；'))}</div>`;
+  }
   if (excludedFacts.length) {
     excludedNotice += `<div class="banner" style="margin-bottom:8px;">提示：共有 ${excludedFacts.length} 处数值/题注事实因处于示例引文语境被豁免，请在上方「事实台账 (FactLedger)」标签中人工复核。</div>`;
   }
@@ -571,7 +619,7 @@ window.submitDecision = async function (findingId, action, expectedRev) {
   }
 
   try {
-    const res = await fetch(`/reviews/${encodeURIComponent(currentRun.run_id)}/decisions`, {
+    const res = await apiFetch(`/reviews/${encodeURIComponent(currentRun.run_id)}/decisions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -613,9 +661,29 @@ function renderPlanTable() {
   </table>`;
 }
 
-function downloadExport(fmt) {
+async function downloadExport(fmt) {
   if (!currentRun) return;
-  window.location.href = `/reviews/${encodeURIComponent(currentRun.run_id)}/export?format=${encodeURIComponent(fmt)}`;
+  try {
+    const res = await apiFetch(
+      `/reviews/${encodeURIComponent(currentRun.run_id)}/export?format=${encodeURIComponent(fmt)}`
+    );
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      showBanner(err.detail || `导出失败 (HTTP ${res.status})`, true);
+      return;
+    }
+    const blob = await res.blob();
+    const ext = fmt === 'json' ? 'json' : fmt === 'markdown' ? 'md' : 'docx';
+    const prefix = fmt === 'summary_docx' ? '综合审评报告' : '审校报告';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${prefix}_${currentRun.run_id}.${ext}`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) {
+    showBanner(`导出异常：${err.message || err}`, true);
+  }
 }
 
 async function exportWordComments() {
@@ -628,7 +696,7 @@ async function exportWordComments() {
   const fd = new FormData();
   fd.append('file', file);
   try {
-    const res = await fetch(`/reviews/${encodeURIComponent(currentRun.run_id)}/export/docx`, {
+    const res = await apiFetch(`/reviews/${encodeURIComponent(currentRun.run_id)}/export/docx`, {
       method: 'POST',
       body: fd,
     });
@@ -705,6 +773,26 @@ function renderDocumentList() {
     parts.join('') || '<p class="hint">没有匹配的规范文档。</p>';
 }
 
+window.exportKnowledgeDoc = async function (docId) {
+  try {
+    const res = await apiFetch(`/knowledge/documents/${encodeURIComponent(docId)}/export`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      showBanner(err.detail || `导出文档失败 (HTTP ${res.status})`, true);
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${docId}.md`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) {
+    showBanner(`导出文档异常：${err.message || err}`, true);
+  }
+};
+
 window.selectKnowledgeDoc = function (docId) {
   selectedDocId = docId;
   renderDocumentList();
@@ -746,7 +834,7 @@ function renderDocumentViewer(doc) {
         </div>
       </div>
       <div class="actions">
-        <a class="btn small" href="/knowledge/documents/${encodeURIComponent(doc.doc_id)}/export">导出 .md</a>
+        <button class="btn small" onclick="exportKnowledgeDoc('${esc(doc.doc_id)}')">导出 .md</button>
         <button class="btn small primary" onclick="openDocumentEditor('${esc(doc.doc_id)}')">编辑与维护此文档</button>
       </div>
     </div>
@@ -921,7 +1009,7 @@ window.saveKnowledgeDocument = async function () {
   const method = editingDocId ? 'PUT' : 'POST';
 
   try {
-    const res = await fetch(url, {
+    const res = await apiFetch(url, {
       method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -942,7 +1030,7 @@ window.saveKnowledgeDocument = async function () {
 
 async function loadEvaluation() {
   try {
-    const res = await fetch('/evaluation/feedback');
+    const res = await apiFetch('/evaluation/feedback');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     const s = data.summary;

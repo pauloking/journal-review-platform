@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import json
 import re
 import time
 from pathlib import Path
@@ -373,12 +374,34 @@ class PlatformContext:
             )
         )
 
-        # 确定性 run_id：同文档、同期刊版本、同规则快照、同模型配置开关产生确定性 ID（绝不含 api_key）
-        llm_tag = f"{resolved_llm.provider}:{resolved_llm.model}" if resolved_llm.enabled else "off"
+        # N4 修复：run_id 种子纳入全部影响输出的 LLM 配置维度（严格排除 api_key）
+        if resolved_llm.enabled:
+            llm_cfg_payload = {
+                "enabled": True,
+                "provider": resolved_llm.provider,
+                "endpoint": resolved_llm.endpoint,
+                "model": resolved_llm.model,
+                "temperature": resolved_llm.temperature,
+                "max_tokens": resolved_llm.max_tokens,
+                "disable_thinking": resolved_llm.disable_thinking,
+                "enabled_rules": sorted(resolved_llm.enabled_rules),
+            }
+            llm_tag = hashlib.sha256(
+                json.dumps(llm_cfg_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()[:12]
+        else:
+            llm_tag = "off"
+
+        ai_truncated = any("context_truncated_24k" in (t.reason or "") for t in final_plan.tasks)
+        if ai_truncated:
+            lim_msg = "AI 语义审校单次上下文仅覆盖前 24,000 字符，超出部分已截断、未纳入本次语义核查。"
+            if lim_msg not in doc_ir.limitations:
+                doc_ir = doc_ir.model_copy(update={"limitations": [*doc_ir.limitations, lim_msg]})
+
         run_seed = f"{doc_ir.document_id}:{journal.id}:{journal.version}:{final_plan.rule_snapshot_hash}:{llm_tag}:{PLATFORM_VERSION}"
         run_id = f"run-{hashlib.sha256(run_seed.encode('utf-8')).hexdigest()[:14]}"
 
-        if has_failure or doc_ir.profile.structure_status != "reliable" or len(rejected) > 0:
+        if has_failure or doc_ir.profile.structure_status != "reliable" or len(rejected) > 0 or ai_truncated:
             status = "complete_with_limitations"
         else:
             status = "completed"

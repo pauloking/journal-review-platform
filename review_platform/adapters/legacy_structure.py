@@ -3,6 +3,7 @@
 """把稿件转换为编辑可使用的结构地图（纯标准库）。"""
 
 import re
+from review_platform.document_engine.text_utils import is_reference_entry as _is_reference_entry
 
 
 BRACKET = r"[\[［【〔]?"

@@ -264,3 +264,178 @@ def test_m5_multiple_accepted_comments_in_same_paragraph(tmp_path: Path):
         comments_xml = zf.read("word/comments.xml").decode("utf-8")
         assert "TERM-MI" in comments_xml
         assert "TERM-CI" in comments_xml
+
+
+def test_n1_redos_brace_quantifier_long_example_and_runtime_timeout(tmp_path: Path, monkeypatch):
+    """N1 回归：{n,} 嵌套量词拦截、超长 example 拦截、以及逃逸静态检查的回溯型正则超时熔断。"""
+    import time
+    from review_platform.rule_registry import registry as reg_mod
+
+    client = TestClient(create_app(db_path=tmp_path / "n1.sqlite3"))
+
+    # 1. {1,} 等价于 +，静态守卫应 422 拒绝
+    res_brace = client.post(
+        "/knowledge/documents",
+        json={
+            "title": "N1 花括号量词测试",
+            "source": "安全测试",
+            "edition": "2026",
+            "scope": "journal",
+            "summary": "拦截嵌套 {n,} 量词",
+            "body_markdown": "# N1 测试",
+            "rules": [
+                {
+                    "rule_id": "N1-BRACE-01",
+                    "nonstandard": r"(a{1,}){1,}$",
+                    "standard": "修正",
+                    "severity": "warning",
+                    "is_regex": True,
+                    "example": "aaa",
+                    "counter_example": "bbb",
+                    "description": "花括号嵌套量词",
+                }
+            ],
+        },
+    )
+    assert res_brace.status_code == 422
+    assert "ReDoS" in res_brace.json()["detail"]
+
+    # 2. 超长 example 超过 500 字上限应被拒绝
+    res_long = client.post(
+        "/knowledge/documents",
+        json={
+            "title": "N1 超长示例测试",
+            "source": "安全测试",
+            "edition": "2026",
+            "scope": "journal",
+            "summary": "拦截超长 example",
+            "body_markdown": "# N1 超长示例",
+            "rules": [
+                {
+                    "rule_id": "N1-LONG-01",
+                    "nonstandard": "foo",
+                    "standard": "bar",
+                    "severity": "warning",
+                    "is_regex": False,
+                    "example": "a" * 501,
+                    "counter_example": "bbb",
+                    "description": "超长正例",
+                }
+            ],
+        },
+    )
+    assert res_long.status_code == 422
+    assert "长度" in res_long.json()["detail"]
+
+    # 3. 即使绕过静态守卫，regex 引擎超时机制也能在 <1s 内中止灾难性回溯而不是卡死
+    monkeypatch.setattr(reg_mod, "check_regex_safety", lambda pattern: None)
+    evasion_doc = {
+        "title": "N1 运行时超时保护",
+        "source": "安全测试",
+        "edition": "2026",
+        "scope": "journal",
+        "summary": "运行时超时测试",
+        "body_markdown": "# N1 运行时超时",
+        "rules": [
+            {
+                "rule_id": "N1-EVADE-01",
+                "nonstandard": r"(a+a+)+$",
+                "standard": "修改",
+                "severity": "warning",
+                "is_regex": True,
+                "example": "aa",
+                "counter_example": "b",
+                "description": "隐式回溯正则",
+            }
+        ],
+    }
+    res_save = client.post("/knowledge/documents", json=evasion_doc)
+    assert res_save.status_code == 200
+
+    evil_raw = make_docx_bytes(["医学临床分析", "a" * 38 + "!"])
+    t0 = time.monotonic()
+    res_rev = client.post(
+        "/reviews?journal=general-medical-cn",
+        files={"file": ("evil.docx", evil_raw, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    elapsed = time.monotonic() - t0
+    assert res_rev.status_code == 200
+    assert elapsed < 3.0
+
+
+def test_n5_frontend_auth_bar_and_health_flag(tmp_path: Path):
+    """N5 回归：启用鉴权时 / 与 /health 可访问、auth_enabled=True，且前端包含令牌输入栏。"""
+    client = TestClient(
+        create_app(
+            db_path=tmp_path / "n5.sqlite3",
+            api_tokens={"tok-edit": ("李编辑", "editor")},
+        )
+    )
+    h = client.get("/health")
+    assert h.status_code == 200
+    assert h.json()["auth_enabled"] is True
+
+    home = client.get("/")
+    assert home.status_code == 200
+    assert 'id="auth-bar"' in home.text
+    app_js = client.get("/static/app.js")
+    assert app_js.status_code == 200
+    assert "sessionStorage" in app_js.text
+    assert "localStorage" not in app_js.text
+
+
+def test_n6_advanced_params_type_and_regex_validation(tmp_path: Path):
+    """N6 回归：advanced_params 非法类型或语法错误正则应返回 422，而非 500。"""
+    client = TestClient(create_app(db_path=tmp_path / "n6.sqlite3"))
+
+    bad_regex_res = client.post(
+        "/knowledge/documents",
+        json={
+            "title": "N6 非法正则参数",
+            "source": "安全测试",
+            "edition": "2026",
+            "scope": "journal",
+            "summary": "N6 测试",
+            "body_markdown": "# N6 测试",
+            "rules": [
+                {
+                    "rule_id": "N6-REGEX-01",
+                    "nonstandard": "abc",
+                    "standard": "def",
+                    "severity": "warning",
+                    "is_regex": False,
+                    "example": "abc",
+                    "counter_example": "xyz",
+                    "description": "非法 exclude_pattern",
+                    "advanced_params": {"exclude_pattern": "("},
+                }
+            ],
+        },
+    )
+    assert bad_regex_res.status_code == 422
+
+    bad_type_res = client.post(
+        "/knowledge/documents",
+        json={
+            "title": "N6 非法参数类型",
+            "source": "安全测试",
+            "edition": "2026",
+            "scope": "journal",
+            "summary": "N6 类型测试",
+            "body_markdown": "# N6 类型测试",
+            "rules": [
+                {
+                    "rule_id": "N6-TYPE-01",
+                    "nonstandard": "abc",
+                    "standard": "def",
+                    "severity": "warning",
+                    "is_regex": False,
+                    "example": "abc",
+                    "counter_example": "xyz",
+                    "description": "非法 skip_context",
+                    "advanced_params": {"skip_context": "not-a-list"},
+                }
+            ],
+        },
+    )
+    assert bad_type_res.status_code == 422
