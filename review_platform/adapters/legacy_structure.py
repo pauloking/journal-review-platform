@@ -207,12 +207,12 @@ def build_map(lines):
             if heading and kind not in {"heading", "title", "separator"} and block_section not in {"title", "front"}:
                 location = f"{heading}—{stable_id}"
 
-        example_cue = bool(re.search(r"(?:例如|如写作|错例|反例|示例|命中|规则|误报|漏检|改为|替换为|所谓)", text))
+        example_cue = bool(re.search(r"(?:例如|如写作|错例|反例|示例)", text))
         excluded_spans = []
         if example_cue:
             for pat in (r"“[^”]{1,160}”", r"『[^』]{1,160}』", r"‘[^’]{1,160}’", r'"[^"\n]{1,160}"'):
                 excluded_spans.extend((m.start(), m.end()) for m in re.finditer(pat, text))
-        exclude_entire = bool(re.search(r"(?:等规范化|换算提示|边界漏检|页码误报|规则触发|检查项包括|范围、世纪年代)", text))
+        exclude_entire = False
         item.update({
             "index": len(blocks) + 1, "id": stable_id, "section": block_section,
             "section_cn": SECTION_CN.get(block_section, block_section), "heading": heading,

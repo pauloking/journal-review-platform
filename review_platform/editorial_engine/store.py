@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
-import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator
 
 from review_platform.models import DecisionRequest, EditorialDecision, ReviewRun
 
@@ -78,43 +78,44 @@ class ReviewStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path, timeout=15.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
 
     def save_run(self, run: ReviewRun) -> ReviewRun:
-        """保存或复用同一 run_id 快照，绝不覆盖已有裁决历史。"""
+        """保存或复用同一 run_id 快照，原子幂等且绝不覆盖已有裁决历史。"""
         payload = run.model_copy(update={"decisions": []}).model_dump_json()
         with self._connect() as conn:
-            existing = conn.execute(
-                "SELECT run_id FROM review_runs WHERE run_id = ?", (run.run_id,)
-            ).fetchone()
-            if not existing:
-                conn.execute(
-                    """
-                    INSERT INTO review_runs (
-                        run_id, created_at, document_id, journal_id,
-                        journal_version, rule_snapshot_hash, status, payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        run.run_id,
-                        run.created_at,
-                        run.document.document_id,
-                        run.journal.id,
-                        run.journal.version,
-                        run.plan.rule_snapshot_hash,
-                        run.status,
-                        payload,
-                    ),
-                )
-                conn.commit()
+            conn.execute(
+                """
+                INSERT INTO review_runs (
+                    run_id, created_at, document_id, journal_id,
+                    journal_version, rule_snapshot_hash, status, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO NOTHING
+                """,
+                (
+                    run.run_id,
+                    run.created_at,
+                    run.document.document_id,
+                    run.journal.id,
+                    run.journal.version,
+                    run.plan.rule_snapshot_hash,
+                    run.status,
+                    payload,
+                ),
+            )
+            conn.commit()
         return self.get_run(run.run_id)
 
     def get_run(self, run_id: str) -> ReviewRun:

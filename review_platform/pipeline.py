@@ -25,6 +25,7 @@ from review_platform.review_engine import execute_plan
 from review_platform.router import build_execution_plan
 from review_platform.rule_registry import (
     RuleRegistry,
+    category_for_basis,
     maintainable_to_rule_spec,
     rule_spec_to_maintainable,
     validate_maintainable_rule,
@@ -81,9 +82,13 @@ class PlatformContext:
             slug = re.sub(r"[^A-Za-z0-9]+", "-", req.title).strip("-").upper()
             if not slug:
                 slug = hashlib.sha256(req.title.encode("utf-8")).hexdigest()[:8].upper()
-            doc_id = f"DOC-CUSTOM-{slug[:24]}"
-            while any(d.doc_id == doc_id for d in self.knowledge.list_documents()):
-                doc_id = f"{doc_id}-{hashlib.sha256(now.encode()).hexdigest()[:4].upper()}"
+            base_doc_id = f"DOC-CUSTOM-{slug[:24]}"
+            doc_id = base_doc_id
+            suffix_n = 2
+            existing_doc_ids = {d.doc_id for d in self.knowledge.list_documents()}
+            while doc_id in existing_doc_ids:
+                doc_id = f"{base_doc_id}-{suffix_n}"
+                suffix_n += 1
             basis_id = f"STD-CUSTOM-{doc_id.removeprefix('DOC-CUSTOM-')}"
             basis_ids = [basis_id]
             is_builtin = False
@@ -98,27 +103,37 @@ class PlatformContext:
                 if item.rule_id in seen_ids:
                     raise ValueError(f"文档内规则 ID 重复: {item.rule_id}")
                 seen_ids.add(item.rule_id)
+
+                merged_item = item
+                trusted_builtin_pattern = False
                 if self.registry.has(item.rule_id):
                     old_rule = self.registry.get(item.rule_id)
                     if old_rule.basis_id != basis_id:
                         raise ValueError(
                             f"规则 ID {item.rule_id} 已被其他规范依据 {old_rule.basis_id} 占用"
                         )
-                validate_maintainable_rule(item)
-                category = "terminology"
-                if basis_id == "STD-GBT15835-2011":
-                    category = "numbers"
-                elif basis_id == "STD-GB3100-3102":
-                    category = "units"
-                elif basis_id == "STD-GBT15834-2011":
-                    category = "punct"
-                elif basis_id == "STD-GBT7714-2025":
-                    category = "references"
-                elif basis_id == "STD-GB3358-STATS":
-                    category = "stats"
+                    # C1 无损往返：继承原注册规则高级参数（ref_only / whole_line / exclude_pattern / skip_if_year / skip_context / dedupe_key / auto）
+                    preserved_adv = {
+                        k: v
+                        for k, v in (old_rule.params or {}).items()
+                        if k not in {"pattern", "is_regex", "exception_after"}
+                    }
+                    preserved_adv["auto"] = old_rule.auto
+                    preserved_adv.update(item.advanced_params or {})
+                    merged_item = item.model_copy(
+                        update={
+                            "category": item.category or old_rule.category,
+                            "advanced_params": preserved_adv,
+                        }
+                    )
+                    if is_builtin and old_rule.params.get("pattern") == item.nonstandard:
+                        trusted_builtin_pattern = True
+
+                validate_maintainable_rule(merged_item, is_builtin_trusted=trusted_builtin_pattern)
+                category = category_for_basis(basis_id, fallback=merged_item.category or "terminology")
                 new_specs.append(
                     maintainable_to_rule_spec(
-                        item,
+                        merged_item,
                         basis_id=basis_id,
                         scope=req.scope,
                         category=category,
@@ -180,13 +195,17 @@ class PlatformContext:
             if doc.supports_rule_editing:
                 specs: list[RuleSpec] = []
                 for item in doc.maintainable_rules:
-                    validate_maintainable_rule(item)
+                    trusted = doc.is_builtin and self.registry.has(item.rule_id) and (
+                        self.registry.get(item.rule_id).params.get("pattern") == item.nonstandard
+                    )
+                    validate_maintainable_rule(item, is_builtin_trusted=trusted)
+                    cat = category_for_basis(doc.basis_id, fallback=item.category or "terminology")
                     specs.append(
                         maintainable_to_rule_spec(
                             item,
                             basis_id=doc.basis_id,
                             scope=doc.scope,
-                            category="terminology",
+                            category=cat,
                             version=doc.version,
                         )
                     )
@@ -349,9 +368,7 @@ class PlatformContext:
         run_seed = f"{doc_ir.document_id}:{journal.id}:{journal.version}:{final_plan.rule_snapshot_hash}:{PLATFORM_VERSION}"
         run_id = f"run-{hashlib.sha256(run_seed.encode('utf-8')).hexdigest()[:14]}"
 
-        if has_failure:
-            status = "complete_with_limitations"
-        elif doc_ir.limitations:
+        if has_failure or doc_ir.profile.structure_status != "reliable" or len(rejected) > 0:
             status = "complete_with_limitations"
         else:
             status = "completed"

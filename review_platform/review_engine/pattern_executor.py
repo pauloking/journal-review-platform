@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+import time
 from typing import Any
+
+RULE_EXEC_BUDGET_MS = 250.0
 
 from review_platform.adapters.legacy_structure import _is_reference_entry
 from review_platform.models import (
@@ -119,6 +123,7 @@ def execute_pattern_rule(
     applies_to = set(rule.applies_to) if rule.applies_to else None
 
     compiled = re.compile(pattern) if is_regex else re.compile(re.escape(pattern))
+    t_start = time.perf_counter()
     findings: list[Finding] = []
     checked = 0
     excluded = 0
@@ -126,6 +131,8 @@ def execute_pattern_rule(
     dedupe_key = params.get("dedupe_key") or ""
 
     for block in doc.blocks:
+        if (time.perf_counter() - t_start) * 1000.0 > RULE_EXEC_BUDGET_MS:
+            raise TimeoutError(f"规则 {rule.id} 执行耗时超出预算（>{RULE_EXEC_BUDGET_MS}ms），已安全熔断")
         if applies_to and block.section not in applies_to:
             continue
         if block.kind == "separator":
@@ -134,6 +141,9 @@ def execute_pattern_rule(
         text = block.text
         if whole_line:
             checked += 1
+            if _in_excluded_span(block, 0, len(text)):
+                excluded += 1
+                continue
             if params.get("ref_only") and not (
                 block.section == "references" and _is_reference_entry(text)
             ):
@@ -222,8 +232,6 @@ def _make_finding(
     fmt_vals: dict[str, Any],
     evidence: dict[str, Any],
 ) -> Finding:
-    import hashlib
-
     raw_id = f"{rule.id}:{block.id}:{start}:{end}:{quote}".encode("utf-8")
     fid = f"f-{hashlib.sha256(raw_id).hexdigest()[:12]}"
     message = _format_template(rule.message_template, fmt_vals)

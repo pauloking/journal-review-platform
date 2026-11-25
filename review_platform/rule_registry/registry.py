@@ -8,8 +8,18 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from review_platform.adapters.legacy_structure import _is_reference_entry
 from review_platform.knowledge_engine import KnowledgeEngine
 from review_platform.models import MaintainableTermRule, RuleSpec, ScopeType
+
+MAX_USER_REGEX_LEN = 500
+# 静态识别常见 ReDoS 灾难性回溯结构：嵌套量词、重叠分支加量词等
+_NESTED_QUANTIFIER_RE = re.compile(
+    r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*(?:[+*?]|\{\d+,\d*\})"
+)
+_OVERLAPPING_ALT_QUANT_RE = re.compile(
+    r"\((?:[^()\\|]|\\.)*\|(?:[^()\\|]|\\.)*\)\s*(?:[+*]|\{\d+,\d*\})"
+)
 
 DEFAULT_RULES_DIR = (
     Path(__file__).resolve().parent.parent / "knowledge_packs" / "medical_cn_v1" / "rules"
@@ -26,12 +36,39 @@ FILE_BASIS_MAP: dict[str, str] = {
     "experience.json": "EXP-EDITORIAL-GUIDE",
 }
 
+BASIS_CATEGORY_MAP: dict[str, str] = {
+    "STD-GBT15835-2011": "numbers",
+    "STD-GB3100-3102": "units",
+    "STD-GBT15834-2011": "punct",
+    "STD-GBT7714-2025": "references",
+    "STD-CNTERM-COMM": "terminology",
+    "STD-GB3358-STATS": "stats",
+}
 
-def validate_maintainable_rule(rule: MaintainableTermRule) -> None:
-    """对可维护规则条目执行正反例门禁校验，严禁未经验证的规则进入正式注册表。"""
+
+def category_for_basis(basis_id: str, fallback: str = "terminology") -> str:
+    return BASIS_CATEGORY_MAP.get(basis_id, fallback)
+
+
+def check_regex_safety(pattern: str) -> None:
+    """静态校验用户自定义正则，拦截嵌套量词与高风险灾难性回溯结构（ReDoS 防护）。"""
+    if len(pattern) > MAX_USER_REGEX_LEN:
+        raise ValueError(f"正则表达式过长（{len(pattern)} > {MAX_USER_REGEX_LEN}），已拒绝")
+    if _NESTED_QUANTIFIER_RE.search(pattern):
+        raise ValueError("检测到高危嵌套量词正则结构（如 (a+)+），存在 ReDoS 风险，已拒绝")
+    if _OVERLAPPING_ALT_QUANT_RE.search(pattern):
+        # 检查多分支加量词时是否存在共享首字符或通配风险
+        raise ValueError("检测到带重复量词的分组分支结构 (a|b)+，为防 ReDoS 请改写或拆分为字面规则")
+
+
+def validate_maintainable_rule(rule: MaintainableTermRule, *, is_builtin_trusted: bool = False) -> None:
+    """对可维护规则条目执行安全性与正反例门禁校验，严禁未经验证的规则进入正式注册表。"""
     pattern = rule.nonstandard.strip()
     if not pattern:
         return
+
+    if rule.is_regex and not is_builtin_trusted:
+        check_regex_safety(pattern)
 
     try:
         compiled = re.compile(pattern) if rule.is_regex else re.compile(re.escape(pattern))
@@ -41,9 +78,36 @@ def validate_maintainable_rule(rule: MaintainableTermRule) -> None:
     if not rule.example.strip():
         raise ValueError(f"规则 {rule.rule_id} 必须提供至少 1 个正例（example）用于验证")
 
+    adv = rule.advanced_params or {}
+    excl_pat = adv.get("exclude_pattern")
+    whole_line = bool(adv.get("whole_line", False))
+    ref_only = bool(adv.get("ref_only", False))
+    skip_if_year = bool(adv.get("skip_if_year", False))
+    skip_context = adv.get("skip_context") or []
+
     def _matches(text: str) -> bool:
+        if ref_only and not _is_reference_entry(text):
+            return False
+        if whole_line:
+            if excl_pat and re.search(excl_pat, text):
+                return False
+            return bool(text.strip())
+        if excl_pat and re.search(excl_pat, text):
+            return False
         for m in compiled.finditer(text):
-            after = text[m.end() : m.end() + 4]
+            start, end = m.start(), m.end()
+            if skip_if_year and m.lastindex and m.lastindex >= 2:
+                try:
+                    lv, rv = int(float(m.group(1))), int(float(m.group(2)))
+                    if 1900 <= lv <= 2099 and 1900 <= rv <= 2099:
+                        continue
+                except ValueError:
+                    pass
+            if skip_context and start > 0:
+                prev_char = text[max(0, start - 3) : start]
+                if any(ctx in prev_char for ctx in skip_context):
+                    continue
+            after = text[end : end + 4]
             if any(after.startswith(exc) for exc in rule.exception_after):
                 continue
             return True
@@ -69,37 +133,51 @@ def maintainable_to_rule_spec(
     version: str = "1.0.0",
 ) -> RuleSpec:
     has_pattern = bool(item.nonstandard.strip())
+    merged_params = dict(item.advanced_params or {})
+    merged_params.update(
+        {
+            "pattern": item.nonstandard,
+            "is_regex": item.is_regex,
+            "exception_after": list(item.exception_after),
+        }
+    )
+    resolved_cat = item.category.strip() or category
+    auto_flag = bool(merged_params.get("auto", has_pattern))
+    executor_type = "pattern_rule" if (auto_flag and has_pattern) else "checklist"
     return RuleSpec(
         id=item.rule_id,
         version=version,
-        title=item.description or f"[{category}] {item.rule_id}",
-        category=category,
+        title=item.description or f"[{resolved_cat}] {item.rule_id}",
+        category=resolved_cat,
         scope=scope,
         basis_id=basis_id,
-        fact_kind="pattern_match" if has_pattern else "manual_check",
+        fact_kind="pattern_match" if executor_type == "pattern_rule" else "manual_check",
         dependencies=["extract.facts"],
         applies_to=list(item.applies_to),
         severity=item.severity,
-        executor_type="pattern_rule" if has_pattern else "checklist",
-        auto=has_pattern,
+        executor_type=executor_type,
+        auto=auto_flag and has_pattern,
         message_template=item.description
         or f"疑似非规范写法「{{found}}」，建议改为「{item.standard or '{suggestion}'}」",
         suggestion_template=item.standard,
         example=item.example,
         counter_example=item.counter_example,
-        params={
-            "pattern": item.nonstandard,
-            "is_regex": item.is_regex,
-            "exception_after": list(item.exception_after),
-        },
+        params=merged_params,
     )
 
 
 def rule_spec_to_maintainable(spec: RuleSpec) -> MaintainableTermRule:
+    adv = {
+        k: v
+        for k, v in (spec.params or {}).items()
+        if k not in {"pattern", "is_regex", "exception_after"}
+    }
+    adv["auto"] = spec.auto
     return MaintainableTermRule(
         rule_id=spec.id,
         nonstandard=str(spec.params.get("pattern", "")),
         standard=spec.suggestion_template,
+        category=spec.category,
         severity=spec.severity,
         is_regex=bool(spec.params.get("is_regex", False)),
         exception_after=list(spec.params.get("exception_after", [])),
@@ -107,6 +185,7 @@ def rule_spec_to_maintainable(spec: RuleSpec) -> MaintainableTermRule:
         example=spec.example,
         counter_example=spec.counter_example,
         description=spec.message_template,
+        advanced_params=adv,
     )
 
 

@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import re
+import zipfile
 from pathlib import Path
 
 from docx import Document
@@ -16,7 +17,30 @@ from review_platform.models import (
     ScopeType,
 )
 
-MAX_RULE_DOC_BYTES = 5 * 1024 * 1024  # 5 MiB
+MAX_RULE_DOC_BYTES = 5 * 1024 * 1024       # 5 MiB
+MAX_RULE_DOC_UNZIP_BYTES = 20 * 1024 * 1024  # 20 MiB
+MAX_RULE_DOC_ZIP_ENTRIES = 1000
+
+
+def _validate_rule_docx_safety(raw_bytes: bytes) -> None:
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw_bytes))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("上传的规则文件不是合法的 DOCX/ZIP 格式") from exc
+    with zf:
+        infos = zf.infolist()
+        if len(infos) > MAX_RULE_DOC_ZIP_ENTRIES:
+            raise ValueError("规则 DOCX 成员数超出安全上限，已拒绝导入")
+        if sum(info.file_size for info in infos) > MAX_RULE_DOC_UNZIP_BYTES:
+            raise ValueError("规则 DOCX 解压体积超出安全上限（20 MiB），已拒绝导入")
+        names = {info.filename for info in infos}
+        if "word/document.xml" not in names:
+            raise ValueError("规则 DOCX 缺少 word/document.xml")
+        for xml_member in ("word/document.xml", "word/styles.xml", "[Content_Types].xml"):
+            if xml_member in names:
+                raw_xml = zf.read(xml_member)
+                if b"<!DOCTYPE" in raw_xml[:8192] or b"<!ENTITY" in raw_xml:
+                    raise ValueError(f"检测到不安全的 XML 实体或 DTD 声明（{xml_member}）")
 
 ARROW_PAIR_RE = re.compile(
     r"^\s*(?:[-*•]\s*|\d+[.、)]\s*)?[「“\"']?([^」”\"'\n\t]{1,60}?)[」”\"']?\s*(?:->|→|=>|改为|应改为|替换为)\s*[「“\"']?([^」”\"'\n\t]{1,80}?)[」”\"']?(?:\s*[（(]([^）)]{1,80})[）)])?\s*$"
@@ -45,6 +69,7 @@ def _infer_edition(text: str) -> str:
 
 
 def _extract_docx_markdown_and_tables(raw_bytes: bytes) -> tuple[str, list[list[list[str]]]]:
+    _validate_rule_docx_safety(raw_bytes)
     doc = Document(io.BytesIO(raw_bytes))
     lines: list[str] = []
     tables: list[list[list[str]]] = []
@@ -238,6 +263,11 @@ def parse_rule_document_bytes(raw_bytes: bytes, filename: str) -> ParsedRuleDocu
             if isinstance(r, dict):
                 pat = str(r.get("nonstandard") or r.get("pattern") or "")
                 std = str(r.get("standard") or r.get("suggestion") or "")
+                raw_exc = r.get("exception_after", [])
+                if raw_exc is None:
+                    raw_exc = []
+                if not isinstance(raw_exc, list) or not all(isinstance(x, str) for x in raw_exc):
+                    raise ValueError(f"第 {idx} 条规则的 exception_after 必须为字符串列表")
                 rules.append(
                     MaintainableTermRule(
                         rule_id=str(r.get("rule_id") or r.get("id") or _safe_rule_id("JSON", idx, pat)),
@@ -245,7 +275,7 @@ def parse_rule_document_bytes(raw_bytes: bytes, filename: str) -> ParsedRuleDocu
                         standard=std,
                         severity=r.get("severity", "warning"),
                         is_regex=bool(r.get("is_regex", False)),
-                        exception_after=list(r.get("exception_after", [])),
+                        exception_after=list(raw_exc),
                         example=str(r.get("example") or (f"示例：{pat}" if pat else "")),
                         counter_example=str(r.get("counter_example") or (f"示例：{std}" if std else "")),
                         description=str(r.get("description") or r.get("message") or ""),

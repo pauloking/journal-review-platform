@@ -102,6 +102,7 @@ class MaintainableTermRule(BaseModel):
     rule_id: str = Field(..., min_length=2, max_length=64)
     nonstandard: str = ""
     standard: str = ""
+    category: str = ""
     severity: SeverityType = "warning"
     is_regex: bool = False
     exception_after: list[str] = Field(default_factory=list)
@@ -122,6 +123,7 @@ class MaintainableTermRule(BaseModel):
     example: str = ""
     counter_example: str = ""
     description: str = ""
+    advanced_params: dict[str, Any] = Field(default_factory=dict)
 
 
 class KnowledgeDocument(BaseModel):

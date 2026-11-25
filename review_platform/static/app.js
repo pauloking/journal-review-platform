@@ -80,19 +80,24 @@ function showBanner(msg, isError = false) {
 }
 
 async function refreshRegistry() {
-  const regRes = await fetch('/registry');
-  const reg = await regRes.json();
-  registryData = reg;
-  document.getElementById('version-badge').textContent = `V${reg.version} · ${reg.rule_snapshot_hash}`;
+  try {
+    const regRes = await fetch('/registry');
+    if (!regRes.ok) throw new Error(`HTTP ${regRes.status}`);
+    const reg = await regRes.json();
+    registryData = reg;
+    document.getElementById('version-badge').textContent = `V${reg.version} · ${reg.rule_snapshot_hash}`;
 
-  const sel = document.getElementById('journal-select');
-  const prevVal = sel.value;
-  sel.innerHTML = reg.journals
-    .map((j) => `<option value="${esc(j.id)}">${esc(j.name)} (${esc(j.id)})</option>`)
-    .join('');
-  if (prevVal) sel.value = prevVal;
+    const sel = document.getElementById('journal-select');
+    const prevVal = sel.value;
+    sel.innerHTML = reg.journals
+      .map((j) => `<option value="${esc(j.id)}">${esc(j.name)} (${esc(j.id)})</option>`)
+      .join('');
+    if (prevVal) sel.value = prevVal;
 
-  renderDocumentLibrary();
+    renderDocumentLibrary();
+  } catch (err) {
+    showBanner(`加载规范注册表失败：${err.message || err}`, true);
+  }
 }
 
 async function init() {
@@ -145,34 +150,25 @@ async function handleRuleDocUpload(ev) {
   const fd = new FormData();
   fd.append('file', file);
   showBanner(`正在解析规范文档「${file.name}」...`);
-  const res = await fetch('/knowledge/documents/parse', { method: 'POST', body: fd });
-  const data = await res.json();
-  if (!res.ok) {
-    showBanner(data.detail || '规则文档解析失败', true);
-    return;
+  try {
+    const res = await fetch('/knowledge/documents/parse', { method: 'POST', body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showBanner(data.detail || '规则文档解析失败', true);
+      return;
+    }
+    showBanner(`已解析「${data.filename}」，识别 ${data.rules.length} 条规则，请检查正反例后保存激活。`);
+    openDocumentEditor(null, data);
+  } catch (err) {
+    showBanner(`上传解析异常：${err.message || err}`, true);
   }
-  showBanner(`已解析「${data.filename}」，识别 ${data.rules.length} 条规则，请检查正反例后保存激活。`);
-  openDocumentEditor(null, data);
 }
 
-function renderLivePipelineProgress(activeIdx) {
+function renderRunningPlaceholder() {
   const card = document.getElementById('pipeline-viz-card');
   card.classList.remove('hidden');
-  const stages = [
-    '① DOCX 解析 → Document IR',
-    '② 装载规范文档与期刊配置',
-    '③ Router DAG 拓扑编排',
-    '④ FactLedger 事实抽取',
-    '⑤ 按规范文档执行规则',
-    '⑥ 锚点与依据门禁核验',
-  ];
-  document.getElementById('pipeline-stepper').innerHTML = stages
-    .map((label, idx) => {
-      const cls = idx < activeIdx ? 'done' : idx === activeIdx ? 'running' : '';
-      const txt = idx < activeIdx ? '已完成' : idx === activeIdx ? '正在执行…' : '等待中';
-      return `<div class="step-node ${cls}"><div class="step-title">${esc(label)}</div><div class="step-summary">${txt}</div></div>`;
-    })
-    .join('');
+  document.getElementById('pipeline-stepper').innerHTML =
+    '<div class="step-node running"><div class="step-title">正在后台执行全量审校流水线…</div><div class="step-summary">等待服务端返回 Document IR、Router DAG 与真实执行追踪（非示意进度）</div></div>';
 }
 
 async function runReview() {
@@ -188,37 +184,37 @@ async function runReview() {
   fd.append('file', file);
 
   showBanner('正在执行审校流水线...');
-  let stageTick = 0;
-  renderLivePipelineProgress(0);
-  const timer = setInterval(() => {
-    if (stageTick < 5) {
-      stageTick++;
-      renderLivePipelineProgress(stageTick);
-    }
-  }, 180);
+  renderRunningPlaceholder();
 
-  const res = await fetch(`/reviews?journal=${encodeURIComponent(journal)}`, { method: 'POST', body: fd });
-  clearInterval(timer);
-  const data = await res.json();
-  if (!res.ok) {
-    showBanner(data.detail || '审校执行失败', true);
-    return;
+  try {
+    const res = await fetch(`/reviews?journal=${encodeURIComponent(journal)}`, { method: 'POST', body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showBanner(data.detail || '审校执行失败', true);
+      return;
+    }
+    currentRun = data;
+    selectedAnchor = null;
+    history.replaceState(null, '', `?run_id=${encodeURIComponent(data.run_id)}`);
+    renderRun();
+    showBanner(`审校完成（状态：${data.status}）：共执行 ${data.plan.tasks.length} 个任务节点，生成 ${data.findings.length} 条可验证意见`);
+  } catch (err) {
+    showBanner(`审校请求异常：${err.message || err}`, true);
   }
-  currentRun = data;
-  selectedAnchor = null;
-  history.replaceState(null, '', `?run_id=${encodeURIComponent(data.run_id)}`);
-  renderRun();
-  showBanner(`审校完成：共执行 ${data.plan.tasks.length} 个任务节点，生成 ${data.findings.length} 条可验证意见`);
 }
 
 async function loadRunById(runId) {
-  const res = await fetch(`/reviews/${encodeURIComponent(runId)}`);
-  if (!res.ok) {
-    showBanner('未能加载指定 run_id', true);
-    return;
+  try {
+    const res = await fetch(`/reviews/${encodeURIComponent(runId)}`);
+    if (!res.ok) {
+      showBanner('未能加载指定 run_id', true);
+      return;
+    }
+    currentRun = await res.json();
+    renderRun();
+  } catch (err) {
+    showBanner(`加载审校记录异常：${err.message || err}`, true);
   }
-  currentRun = await res.json();
-  renderRun();
 }
 
 async function refreshCurrentRun() {
@@ -395,6 +391,11 @@ function renderFindings() {
   const latest = latestDecisionsMap();
   const actionLabels = { accept: '已采纳', reject: '已驳回', defer: '暂缓' };
 
+  const excludedFacts = (currentRun.facts || []).filter((f) => f.status === 'excluded');
+  const excludedNotice = excludedFacts.length
+    ? `<div class="banner" style="margin-bottom:10px;">提示：共有 ${excludedFacts.length} 处数值/题注事实因处于示例引文语境被豁免，请在上方「事实台账 (FactLedger)」标签中人工复核。</div>`
+    : '';
+
   const items = currentRun.findings.filter((f) => {
     const dec = latest[f.id];
     const st = dec ? dec.action : 'pending';
@@ -402,11 +403,11 @@ function renderFindings() {
   });
 
   if (!items.length) {
-    wrap.innerHTML = '<p class="hint">当前筛选条件下无审校意见。</p>';
+    wrap.innerHTML = excludedNotice + '<p class="hint">当前筛选条件下无审校意见。</p>';
     return;
   }
 
-  wrap.innerHTML = items
+  wrap.innerHTML = excludedNotice + items
     .map((f) => {
       const dec = latest[f.id];
       const rev = dec ? dec.revision : 0;
@@ -441,27 +442,40 @@ window.locateAnchor = function (findingId) {
 };
 
 window.submitDecision = async function (findingId, action, expectedRev) {
-  const editor = document.getElementById('editor-name').value.trim() || '责编';
-  const reasonEl = document.getElementById('reason-' + findingId);
-  const reason = (reasonEl?.value || '').trim() || (action === 'accept' ? '确认问题有效，采纳修改建议' : '经编辑复核后处理');
-
-  const res = await fetch(`/reviews/${encodeURIComponent(currentRun.run_id)}/decisions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      finding_id: findingId,
-      action,
-      editor,
-      reason,
-      expected_revision: expectedRev,
-    }),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    showBanner(data.detail || '提交裁决失败', true);
+  const editor = document.getElementById('editor-name').value.trim();
+  if (!editor) {
+    showBanner('请先填写编辑署名后再提交裁决', true);
     return;
   }
-  await refreshCurrentRun();
+  const reasonEl = document.getElementById('reason-' + findingId);
+  const reason = (reasonEl?.value || '').trim();
+  if (!reason) {
+    showBanner('请填写具体的裁决理由（必填，用于审计与评估）', true);
+    if (reasonEl) reasonEl.focus();
+    return;
+  }
+
+  try {
+    const res = await fetch(`/reviews/${encodeURIComponent(currentRun.run_id)}/decisions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        finding_id: findingId,
+        action,
+        editor,
+        reason,
+        expected_revision: expectedRev,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showBanner(data.detail || '提交裁决失败', true);
+      return;
+    }
+    await refreshCurrentRun();
+  } catch (err) {
+    showBanner(`提交裁决异常：${err.message || err}`, true);
+  }
 };
 
 function renderPlanTable() {
@@ -498,23 +512,33 @@ async function exportWordComments() {
   }
   const fd = new FormData();
   fd.append('file', file);
-  const res = await fetch(`/reviews/${encodeURIComponent(currentRun.run_id)}/export/docx`, {
-    method: 'POST',
-    body: fd,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    showBanner(err.detail || '导出批注 DOCX 失败', true);
-    return;
+  try {
+    const res = await fetch(`/reviews/${encodeURIComponent(currentRun.run_id)}/export/docx`, {
+      method: 'POST',
+      body: fd,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      showBanner(err.detail || '导出批注 DOCX 失败', true);
+      return;
+    }
+    const exportedCount = res.headers.get('X-Exported-Comments') || '';
+    const skippedCount = Number(res.headers.get('X-Skipped-Comments') || '0');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `原生批注_${currentRun.run_id}.docx`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showBanner(
+      skippedCount > 0
+        ? `已导出 ${exportedCount} 条原生批注（另有 ${skippedCount} 条因区间重叠或既有批注冲突已跳过）`
+        : `已导出 ${exportedCount} 条带原生 Word 批注的 DOCX 副本`
+    );
+  } catch (err) {
+    showBanner(`导出批注 DOCX 异常：${err.message || err}`, true);
   }
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `原生批注_${currentRun.run_id}.docx`;
-  a.click();
-  URL.revokeObjectURL(url);
-  showBanner('已导出带原生 Word 批注的 DOCX 副本');
 }
 
 function renderDocumentLibrary() {
@@ -781,43 +805,53 @@ window.saveKnowledgeDocument = async function () {
     : '/knowledge/documents';
   const method = editingDocId ? 'PUT' : 'POST';
 
-  const res = await fetch(url, {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    errBox.textContent = data.detail || '验证或保存失败';
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      errBox.textContent = data.detail || '验证或保存失败';
+      errBox.classList.remove('hidden');
+      return;
+    }
+    selectedDocId = data.doc_id;
+    await refreshRegistry();
+  } catch (err) {
+    errBox.textContent = `保存异常：${err.message || err}`;
     errBox.classList.remove('hidden');
-    return;
   }
-  selectedDocId = data.doc_id;
-  await refreshRegistry();
 };
 
 async function loadEvaluation() {
-  const res = await fetch('/evaluation/feedback');
-  const data = await res.json();
-  const s = data.summary;
-  const rows = (data.recent || [])
-    .map(
-      (r) => `<tr>
+  try {
+    const res = await fetch('/evaluation/feedback');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const s = data.summary;
+    const rows = (data.recent || [])
+      .map(
+        (r) => `<tr>
       <td>${esc(r.created_at)}</td>
       <td><code>${esc(r.rule_id)}</code></td>
       <td>${esc(r.action)}</td>
       <td>${esc(r.editor)}</td>
       <td>${esc(r.reason)}</td>
     </tr>`
-    )
-    .join('');
-  document.getElementById('eval-content').innerHTML = `
-    <p>总反馈条数：<b>${s.total_feedback}</b> ｜ 动作分布：<code>${esc(JSON.stringify(s.actions))}</code> ｜ 大类分布：<code>${esc(JSON.stringify(s.by_group))}</code></p>
-    <table>
-      <tr><th>时间</th><th>规则</th><th>动作</th><th>编辑</th><th>理由</th></tr>
-      ${rows || '<tr><td colspan="5">暂无反馈事件</td></tr>'}
-    </table>
-  `;
+      )
+      .join('');
+    document.getElementById('eval-content').innerHTML = `
+      <p>总反馈条数：<b>${s.total_feedback}</b> ｜ 动作分布：<code>${esc(JSON.stringify(s.actions))}</code> ｜ 大类分布：<code>${esc(JSON.stringify(s.by_group))}</code></p>
+      <table>
+        <tr><th>时间</th><th>规则</th><th>动作</th><th>编辑</th><th>理由</th></tr>
+        ${rows || '<tr><td colspan="5">暂无反馈事件</td></tr>'}
+      </table>
+    `;
+  } catch (err) {
+    document.getElementById('eval-content').innerHTML = `<p class="banner error">加载评估反馈失败：${esc(err.message || err)}</p>`;
+  }
 }
 
 init();

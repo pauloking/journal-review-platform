@@ -22,7 +22,7 @@
 
 ## 3. 历史回归与当前实测基线（2026-11-25）
 
-- **本平台自动化测试（`.venv/bin/python -m pytest -v`，Python 3.12.13）**：`13 passed, 1 warning in 0.43s`（覆盖 `DocumentIR` 安全解析与锚点、Knowledge/Registry/Router DAG、P 值/百分比/题注/复用规则正反边界例外、LLM JSON 容错、乐观并发裁决、原生 Word 批注导出、综合报告导出及 CLI 全流程）。
+- **本平台自动化测试（`.venv/bin/python -m pytest -v`，Python 3.12.13）**：`22 passed, 1 warning`（覆盖 `DocumentIR` 安全解析与锚点、Knowledge/Registry/Router DAG、P 值/百分比/题注/复用规则正反边界例外、规则文档无损往返与重启保持、ReDoS 静态与执行预算拦截、流式上传限额与 ZIP 炸弹拦截、Bearer RBAC 鉴权、同段多批注 Word 导出、LLM JSON 容错、乐观并发裁决、综合报告导出及 CLI 全流程）。
 - **历史基线核对（未改动原仓库）**：
   - `medical-journal-copyediting-2.0.0`：`scripts/tests/run_tests.py` 实测 `25/25` 通过（`F1=1.000`）。
   - `medical-journal-reviewer`：`npm test`（Vitest）实测 9 个文件 `95/95` 通过，`npm run build` 构建通过。

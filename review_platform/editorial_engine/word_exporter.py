@@ -1,11 +1,10 @@
-"""原生 Word 批注导出器（融合 docxGenerator.ts 安全经验与精确 RunSpan 拆分）。
+"""原生 Word 批注导出器（支持同段多批注、局部 lxml 命名空间、SHA-256 指纹校验）。
 
 核心纪律：
 1. 必须校验上传原稿 SHA-256 == run.document.source_sha256，防止旧定位写错文件。
 2. 仅导出最新裁决为 accept 的意见，不修改正文字数与数值。
-3. 使用 ElementTree 精确解析 <w:r>/<w:t>（绝不用正则扫 <w:t> 避免误吞 <w:topLinePunct/> 等标签），
-   按 Unicode 区间精准拆分直接 Run 并保留 <w:rPr> 样式。
-4. 目标段落已存在批注、区间重叠或引文落在超链接等非直接 Run 容器时，显式拒绝并说明原因，不静默丢弃或错位挂接。
+3. 使用 lxml.etree 精确解析 <w:r>/<w:t>，支持同段多条非重叠批注按 Unicode 区间拆分并保留 <w:rPr> 样式。
+4. 目标段落已包含原稿既有批注、意见区间重叠或落在非直接 Run 容器时，显式跳过并列明原因，不再因同段两条意见而整体 422 失败。
 """
 
 from __future__ import annotations
@@ -15,18 +14,19 @@ import datetime
 import hashlib
 import io
 import zipfile
-import xml.etree.ElementTree as ET
+from collections import defaultdict
+
+from lxml import etree
 
 from review_platform.models import Block, EditorialDecision, Finding, ReviewRun
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 REL_COMMENTS_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
 CT_COMMENTS = "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"
 CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 PR_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
-
-ET.register_namespace("w", W_NS)
-ET.register_namespace("r", "http://schemas.openxmlformats.org/officeDocument/2006/relationships")
+XML_SPACE_ATTR = "{http://www.w3.org/XML/1998/namespace}space"
 
 
 class WordExportError(ValueError):
@@ -41,15 +41,14 @@ def _q(ns: str, tag: str) -> str:
     return f"{{{ns}}}{tag}"
 
 
-def _locate_paragraph(body: ET.Element, block: Block) -> ET.Element:
-    """根据 DocumentIR 记录的 meta 索引定位对应的 <w:p> 元素。"""
+def _locate_paragraph(body: etree._Element, block: Block) -> etree._Element:
     meta = block.meta or {}
     if block.kind == "table_cell":
         t_idx = int(meta["table"]) - 1
         r_idx = int(meta["row"]) - 1
         c_idx = int(meta["col"]) - 1
         cp_idx = int(meta["cell_p"]) - 1
-        tables = [el for el in list(body) if el.tag == _q(W_NS, "tbl")]
+        tables = [el for el in body if el.tag == _q(W_NS, "tbl")]
         if t_idx >= len(tables):
             raise WordExportError(f"找不到表格索引 {t_idx + 1}")
         trs = tables[t_idx].findall(_q(W_NS, "tr"))
@@ -57,73 +56,85 @@ def _locate_paragraph(body: ET.Element, block: Block) -> ET.Element:
         ps = tcs[c_idx].findall(_q(W_NS, "p"))
         return ps[cp_idx]
     p_idx = int(meta["body_p_index"]) - 1
-    paras = [el for el in list(body) if el.tag == _q(W_NS, "p")]
+    paras = [el for el in body if el.tag == _q(W_NS, "p")]
     if p_idx >= len(paras):
         raise WordExportError(f"找不到正文段落索引 {p_idx + 1}")
     return paras[p_idx]
 
 
-def _run_visible_len(run_elem: ET.Element) -> int:
-    total = 0
-    for child in run_elem:
-        if child.tag == _q(W_NS, "t"):
-            total += len(child.text or "")
-        elif child.tag in (_q(W_NS, "tab"), _q(W_NS, "br"), _q(W_NS, "cr")):
-            total += 1
-    return total
+def _run_is_simple_text_only(run_elem: etree._Element) -> bool:
+    return all(child.tag in (_q(W_NS, "rPr"), _q(W_NS, "t")) for child in run_elem)
 
 
-def _run_is_simple_text_only(run_elem: ET.Element) -> bool:
-    for child in run_elem:
-        if child.tag not in (_q(W_NS, "rPr"), _q(W_NS, "t")):
-            return False
-    return True
-
-
-def _make_run_with_text(template_run: ET.Element, text: str) -> ET.Element:
-    clone = ET.Element(_q(W_NS, "r"), dict(template_run.attrib))
+def _make_run_with_text(template_run: etree._Element, text: str) -> etree._Element:
+    clone = etree.Element(_q(W_NS, "r"), attrib=dict(template_run.attrib))
     rpr = template_run.find(_q(W_NS, "rPr"))
     if rpr is not None:
         clone.append(copy.deepcopy(rpr))
-    t = ET.SubElement(clone, _q(W_NS, "t"))
+    t = etree.SubElement(clone, _q(W_NS, "t"))
     if text[:1].isspace() or text[-1:].isspace():
-        t.set("{http://www.w3.org/XML/1998/namespace}space", "space" and "preserve")
+        t.set(XML_SPACE_ATTR, "preserve")
     t.text = text
     return clone
 
 
-def _inject_comment_range_into_paragraph(
-    p_elem: ET.Element,
+def _inject_multiple_comments_into_paragraph(
+    p_elem: etree._Element,
     block: Block,
-    finding: Finding,
-    comment_id: int,
-) -> None:
-    """按精确 Unicode 区间拆分直接 <w:r> 并插入 commentRangeStart/End/Reference。"""
+    items: list[tuple[Finding, EditorialDecision, int]],
+) -> tuple[list[tuple[Finding, EditorialDecision, int]], list[str]]:
+    """支持在同一个段落内注入多条非重叠批注，对原稿既有批注或重叠项显式跳过并说明原因。"""
+    skipped: list[str] = []
     if (
         p_elem.find(f".//{_q(W_NS, 'commentRangeStart')}") is not None
         or p_elem.find(f".//{_q(W_NS, 'commentReference')}") is not None
     ):
-        raise WordExportError(
-            f"段落 {block.id} 已包含既有批注或同一段落存在多条批注重叠，已安全拒绝修改原段落 XML"
-        )
+        for f, _, _ in items:
+            skipped.append(f"{f.id}:段落 {block.id} 已含原稿既有批注")
+        return [], skipped
 
-    start, end = finding.anchor.start, finding.anchor.end
-    direct_runs = [(idx, child) for idx, child in enumerate(list(p_elem)) if child.tag == _q(W_NS, "r")]
+    direct_runs = [child for child in p_elem if child.tag == _q(W_NS, "r")]
     if not direct_runs or len(direct_runs) != len(block.runs):
-        raise WordExportError(f"段落 {block.id} 的 Run 结构与解析结果不一致（可能含超链接或复杂域）")
+        for f, _, _ in items:
+            skipped.append(f"{f.id}:段落 {block.id} 含超链接或复杂域，无法安全拆分 Run")
+        return [], skipped
 
-    # 校验目标区间必须完整落在连续直接 <w:r> 覆盖范围内
-    covered = False
-    for r_span in block.runs:
-        if r_span.start < end and r_span.end > start:
+    # 筛选非重叠、区间有效的项（按 start, end 升序）
+    ordered = sorted(items, key=lambda x: (x[0].anchor.start, x[0].anchor.end))
+    active: list[tuple[Finding, EditorialDecision, int]] = []
+    last_end = -1
+
+    for f, dec, cid in ordered:
+        s, e = f.anchor.start, f.anchor.end
+        if s < last_end:
+            skipped.append(f"{f.id}:与同段前一条批注区间重叠")
+            continue
+        # 检查是否可完整拆分覆盖
+        can_apply = True
+        covered = False
+        for r_idx, r_span in enumerate(block.runs):
+            if r_span.end <= s or r_span.start >= e:
+                continue
             covered = True
-    if not covered:
-        raise WordExportError(f"意见 {finding.id} 的引文落在非直接文本容器（如超链接）内，无法安全写回批注")
+            run_el = direct_runs[r_idx]
+            r_text = "".join(t.text or "" for t in run_el.findall(_q(W_NS, "t")))
+            if not _run_is_simple_text_only(run_el) or len(r_text) != (r_span.end - r_span.start):
+                if not (r_span.start >= s and r_span.end <= e):
+                    can_apply = False
+                    break
+        if not covered or not can_apply:
+            skipped.append(f"{f.id}:引文落在非直接文本容器或跨不可拆分制表符")
+            continue
+        active.append((f, dec, cid))
+        last_end = e
 
-    new_children: list[ET.Element] = []
+    if not active:
+        return [], skipped
+
+    new_children: list[etree._Element] = []
     run_ptr = 0
-    range_started = False
-    range_ended = False
+    started_ids: set[int] = set()
+    ended_ids: set[int] = set()
 
     for child in list(p_elem):
         if child.tag != _q(W_NS, "r"):
@@ -134,70 +145,69 @@ def _inject_comment_range_into_paragraph(
         run_ptr += 1
         r_start, r_end = r_span.start, r_span.end
 
-        # 完全在目标区间外
-        if r_end <= start or r_start >= end:
+        intersecting = [
+            (f, cid) for f, _, cid in active if r_start < f.anchor.end and r_end > f.anchor.start
+        ]
+        if not intersecting:
             new_children.append(child)
             continue
 
-        # 命中当前 run，检查是否为可安全拆分的纯文本 run
         r_text = "".join(t.text or "" for t in child.findall(_q(W_NS, "t")))
         if not _run_is_simple_text_only(child) or len(r_text) != (r_end - r_start):
-            if r_start >= start and r_end <= end:
-                # 整 run 被覆盖，无需拆分内部元素
-                if not range_started:
-                    cs = ET.Element(_q(W_NS, "commentRangeStart"))
-                    cs.set(_q(W_NS, "id"), str(comment_id))
+            # 整 run 被单一批注覆盖
+            f, cid = intersecting[0]
+            if f.anchor.start >= r_start and cid not in started_ids:
+                cs = etree.Element(_q(W_NS, "commentRangeStart"))
+                cs.set(_q(W_NS, "id"), str(cid))
+                new_children.append(cs)
+                started_ids.add(cid)
+            new_children.append(child)
+            if f.anchor.end <= r_end and cid not in ended_ids:
+                ce = etree.Element(_q(W_NS, "commentRangeEnd"))
+                ce.set(_q(W_NS, "id"), str(cid))
+                new_children.append(ce)
+                ref_r = etree.Element(_q(W_NS, "r"))
+                ref = etree.SubElement(ref_r, _q(W_NS, "commentReference"))
+                ref.set(_q(W_NS, "id"), str(cid))
+                new_children.append(ref_r)
+                ended_ids.add(cid)
+            continue
+
+        cuts = {0, len(r_text)}
+        for f, _ in intersecting:
+            cuts.add(max(0, f.anchor.start - r_start))
+            cuts.add(min(len(r_text), f.anchor.end - r_start))
+        sorted_cuts = sorted(cuts)
+
+        for a, b in zip(sorted_cuts[:-1], sorted_cuts[1:]):
+            abs_a = r_start + a
+            abs_b = r_start + b
+            for f, cid in intersecting:
+                if f.anchor.start == abs_a and cid not in started_ids:
+                    cs = etree.Element(_q(W_NS, "commentRangeStart"))
+                    cs.set(_q(W_NS, "id"), str(cid))
                     new_children.append(cs)
-                    range_started = True
-                new_children.append(child)
-                if r_end >= end and not range_ended:
-                    ce = ET.Element(_q(W_NS, "commentRangeEnd"))
-                    ce.set(_q(W_NS, "id"), str(comment_id))
+                    started_ids.add(cid)
+
+            new_children.append(_make_run_with_text(child, r_text[a:b]))
+
+            for f, cid in intersecting:
+                if f.anchor.end == abs_b and cid not in ended_ids:
+                    ce = etree.Element(_q(W_NS, "commentRangeEnd"))
+                    ce.set(_q(W_NS, "id"), str(cid))
                     new_children.append(ce)
-                    ref_r = ET.Element(_q(W_NS, "r"))
-                    ref = ET.SubElement(ref_r, _q(W_NS, "commentReference"))
-                    ref.set(_q(W_NS, "id"), str(comment_id))
+                    ref_r = etree.Element(_q(W_NS, "r"))
+                    ref = etree.SubElement(ref_r, _q(W_NS, "commentReference"))
+                    ref.set(_q(W_NS, "id"), str(cid))
                     new_children.append(ref_r)
-                    range_ended = True
-                continue
-            raise WordExportError(f"段落 {block.id} 目标区间跨越不可拆分制表符/换行符，已拒绝导出")
+                    ended_ids.add(cid)
 
-        rel_s = max(0, start - r_start)
-        rel_e = min(len(r_text), end - r_start)
+    for elem in list(p_elem):
+        p_elem.remove(elem)
+    for elem in new_children:
+        p_elem.append(elem)
 
-        prefix = r_text[:rel_s]
-        middle = r_text[rel_s:rel_e]
-        suffix = r_text[rel_e:]
-
-        if prefix:
-            new_children.append(_make_run_with_text(child, prefix))
-
-        if not range_started:
-            cs = ET.Element(_q(W_NS, "commentRangeStart"))
-            cs.set(_q(W_NS, "id"), str(comment_id))
-            new_children.append(cs)
-            range_started = True
-
-        if middle:
-            new_children.append(_make_run_with_text(child, middle))
-
-        if r_end >= end and not range_ended:
-            ce = ET.Element(_q(W_NS, "commentRangeEnd"))
-            ce.set(_q(W_NS, "id"), str(comment_id))
-            new_children.append(ce)
-            ref_r = ET.Element(_q(W_NS, "r"))
-            ref = ET.SubElement(ref_r, _q(W_NS, "commentReference"))
-            ref.set(_q(W_NS, "id"), str(comment_id))
-            new_children.append(ref_r)
-            range_ended = True
-
-        if suffix:
-            new_children.append(_make_run_with_text(child, suffix))
-
-    if not range_started or not range_ended:
-        raise WordExportError(f"段落 {block.id} 批注区间闭合失败")
-
-    p_elem[:] = new_children
+    return active, skipped
 
 
 def _format_comment_lines(finding: Finding, dec: EditorialDecision) -> list[str]:
@@ -210,7 +220,9 @@ def _format_comment_lines(finding: Finding, dec: EditorialDecision) -> list[str]
     ]
 
 
-def export_annotated_docx(raw_docx: bytes, run: ReviewRun) -> tuple[bytes, int]:
+def export_annotated_docx(
+    raw_docx: bytes, run: ReviewRun, *, return_skipped: bool = False
+) -> tuple[bytes, int] | tuple[bytes, int, list[str]]:
     """校验原稿 SHA-256 后，将已采纳的审校意见写回原生 Word 批注副本。"""
     sha = hashlib.sha256(raw_docx).hexdigest()
     if sha != run.document.source_sha256:
@@ -239,13 +251,14 @@ def export_annotated_docx(raw_docx: bytes, run: ReviewRun) -> tuple[bytes, int]:
     with zipfile.ZipFile(buf, "r") as zin:
         entries = {name: zin.read(name) for name in zin.namelist()}
 
-    doc_root = ET.fromstring(entries["word/document.xml"])
+    parser = etree.XMLParser(resolve_entities=False, no_network=True)
+    doc_root = etree.fromstring(entries["word/document.xml"], parser=parser)
     body = doc_root.find(_q(W_NS, "body"))
     if body is None:
         raise WordExportError("DOCX 缺少 w:body 节点", status_code=422)
 
     if "word/comments.xml" in entries:
-        comments_root = ET.fromstring(entries["word/comments.xml"])
+        comments_root = etree.fromstring(entries["word/comments.xml"], parser=parser)
         existing_ids = [
             int(c.attrib.get(_q(W_NS, "id"), "0"))
             for c in comments_root.findall(_q(W_NS, "comment"))
@@ -253,55 +266,71 @@ def export_annotated_docx(raw_docx: bytes, run: ReviewRun) -> tuple[bytes, int]:
         ]
         next_cid = (max(existing_ids) + 1) if existing_ids else 0
     else:
-        comments_root = ET.Element(_q(W_NS, "comments"))
+        comments_root = etree.Element(_q(W_NS, "comments"), nsmap={"w": W_NS, "r": R_NS})
         next_cid = 0
 
     now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    # 按段落聚合，原生支持同段多条非重叠批注
+    by_block: dict[str, list[tuple[Finding, EditorialDecision, int]]] = defaultdict(list)
     for finding, dec in accepted_pairs:
-        block = block_map.get(finding.anchor.block_id)
-        if block is None:
-            raise WordExportError(f"找不到对应块: {finding.anchor.block_id}", status_code=422)
-        p_elem = _locate_paragraph(body, block)
         cid = next_cid
         next_cid += 1
-        _inject_comment_range_into_paragraph(p_elem, block, finding, cid)
+        by_block[finding.anchor.block_id].append((finding, dec, cid))
 
-        c_elem = ET.SubElement(comments_root, _q(W_NS, "comment"))
+    exported_items: list[tuple[Finding, EditorialDecision, int]] = []
+    skipped_reasons: list[str] = []
+
+    for block_id, items in by_block.items():
+        block = block_map.get(block_id)
+        if block is None:
+            for f, _, _ in items:
+                skipped_reasons.append(f"{f.id}:找不到对应块 {block_id}")
+            continue
+        p_elem = _locate_paragraph(body, block)
+        applied, skipped = _inject_multiple_comments_into_paragraph(p_elem, block, items)
+        exported_items.extend(applied)
+        skipped_reasons.extend(skipped)
+
+    if not exported_items:
+        raise WordExportError(
+            "所有已采纳意见均无法安全注入 Word 批注：" + "；".join(skipped_reasons),
+            status_code=422,
+        )
+
+    for finding, dec, cid in exported_items:
+        c_elem = etree.SubElement(comments_root, _q(W_NS, "comment"))
         c_elem.set(_q(W_NS, "id"), str(cid))
         c_elem.set(_q(W_NS, "author"), f"审校平台·{dec.editor}")
         c_elem.set(_q(W_NS, "date"), now_iso)
         c_elem.set(_q(W_NS, "initials"), "RP")
         for line in _format_comment_lines(finding, dec):
-            cp = ET.SubElement(c_elem, _q(W_NS, "p"))
-            cr = ET.SubElement(cp, _q(W_NS, "r"))
-            ct = ET.SubElement(cr, _q(W_NS, "t"))
+            cp = etree.SubElement(c_elem, _q(W_NS, "p"))
+            cr = etree.SubElement(cp, _q(W_NS, "r"))
+            ct = etree.SubElement(cr, _q(W_NS, "t"))
             ct.text = line
 
-    entries["word/document.xml"] = ET.tostring(doc_root, encoding="utf-8", xml_declaration=True)
-    entries["word/comments.xml"] = ET.tostring(comments_root, encoding="utf-8", xml_declaration=True)
+    entries["word/document.xml"] = etree.tostring(doc_root, encoding="utf-8", xml_declaration=True)
+    entries["word/comments.xml"] = etree.tostring(comments_root, encoding="utf-8", xml_declaration=True)
 
-    # 更新 [Content_Types].xml
+    # 局部命名空间处理，绝不污染进程级全局表
     if "[Content_Types].xml" in entries:
-        ct_root = ET.fromstring(entries["[Content_Types].xml"])
-        ET.register_namespace("", CT_NS)
+        ct_root = etree.fromstring(entries["[Content_Types].xml"], parser=parser)
         has_override = any(
             el.attrib.get("PartName") == "/word/comments.xml"
             for el in ct_root.findall(_q(CT_NS, "Override"))
         )
         if not has_override:
-            ov = ET.SubElement(ct_root, _q(CT_NS, "Override"))
+            ov = etree.SubElement(ct_root, _q(CT_NS, "Override"))
             ov.set("PartName", "/word/comments.xml")
             ov.set("ContentType", CT_COMMENTS)
-            entries["[Content_Types].xml"] = ET.tostring(
+            entries["[Content_Types].xml"] = etree.tostring(
                 ct_root, encoding="utf-8", xml_declaration=True
             )
 
-    # 更新 word/_rels/document.xml.rels
     rels_path = "word/_rels/document.xml.rels"
     if rels_path in entries:
-        rel_root = ET.fromstring(entries[rels_path])
-        ET.register_namespace("", PR_NS)
+        rel_root = etree.fromstring(entries[rels_path], parser=parser)
         has_rel = any(
             el.attrib.get("Type") == REL_COMMENTS_TYPE
             for el in rel_root.findall(_q(PR_NS, "Relationship"))
@@ -313,15 +342,17 @@ def export_annotated_docx(raw_docx: bytes, run: ReviewRun) -> tuple[bytes, int]:
                 if el.attrib.get("Id", "").startswith("rId") and el.attrib["Id"][3:].isdigit()
             ]
             new_rid = f"rId{(max(existing_rids) + 1) if existing_rids else 1}"
-            rel = ET.SubElement(rel_root, _q(PR_NS, "Relationship"))
+            rel = etree.SubElement(rel_root, _q(PR_NS, "Relationship"))
             rel.set("Id", new_rid)
             rel.set("Type", REL_COMMENTS_TYPE)
             rel.set("Target", "comments.xml")
-            entries[rels_path] = ET.tostring(rel_root, encoding="utf-8", xml_declaration=True)
+            entries[rels_path] = etree.tostring(rel_root, encoding="utf-8", xml_declaration=True)
 
     out_buf = io.BytesIO()
     with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zout:
         for name, data in entries.items():
             zout.writestr(name, data)
 
-    return out_buf.getvalue(), len(accepted_pairs)
+    if return_skipped:
+        return out_buf.getvalue(), len(exported_items), skipped_reasons
+    return out_buf.getvalue(), len(exported_items)

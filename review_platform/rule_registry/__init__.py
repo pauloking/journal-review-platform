@@ -2,6 +2,8 @@
 
 from .registry import (
     RuleRegistry,
+    category_for_basis,
+    check_regex_safety,
     maintainable_to_rule_spec,
     rule_spec_to_maintainable,
     validate_maintainable_rule,
@@ -9,6 +11,8 @@ from .registry import (
 
 __all__ = [
     "RuleRegistry",
+    "category_for_basis",
+    "check_regex_safety",
     "maintainable_to_rule_spec",
     "rule_spec_to_maintainable",
     "validate_maintainable_rule",

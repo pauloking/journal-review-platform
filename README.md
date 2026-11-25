@@ -10,7 +10,7 @@
 
 ```bash
 # 1. 进入项目并激活虚拟环境
-cd /Users/wangguoyang/.gemini/antigravity/scratch/journal-review-platform
+cd journal-review-platform
 source .venv/bin/activate
 
 # 2. 运行全部自动化测试
@@ -20,8 +20,11 @@ python -m pytest -q
 python examples/make_demo.py
 python -m review_platform examples/demo.docx --format markdown --output var/demo-report.md
 
-# 4. 启动本地编辑工作台与 API 服务
+# 4. 启动本地编辑工作台与 API 服务（仅监听本机）
 python -m uvicorn review_platform.api:create_app --factory --host 127.0.0.1 --port 8000
+
+# 可选：部署鉴权（通过环境变量启用 Bearer Token + RBAC）
+# export REVIEW_API_TOKENS='{"tok-editor":{"user":"王编辑","role":"editor"},"tok-admin":{"user":"规则管理员","role":"admin"}}'
 ```
 
 打开浏览器访问 `http://127.0.0.1:8000/` 即可体验完整纵向闭环（上传 DOCX → Document IR → Router DAG → 带原文高亮与依据的意见 → 编辑裁决 → 导出原生 Word 批注与综合报告）。
