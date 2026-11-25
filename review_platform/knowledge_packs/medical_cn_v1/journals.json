@@ -1,0 +1,40 @@
+[
+  {
+    "id": "general-medical-cn",
+    "name": "中文综合医学期刊（默认配置）",
+    "version": "1.0.0",
+    "discipline": "medical",
+    "enabled_scopes": ["national", "professional", "journal", "experience"],
+    "disabled_rules": [],
+    "percentage_tolerance": 0.5,
+    "caption_start": 1,
+    "custom_terms": {},
+    "description": "启用国家标准、医学行业规范、期刊图表顺序与百分比复算等全量确定性审校能力。"
+  },
+  {
+    "id": "cardiology-strict",
+    "name": "心血管医学期刊（严格容差版）",
+    "version": "1.0.0",
+    "discipline": "medical",
+    "enabled_scopes": ["national", "professional", "journal"],
+    "disabled_rules": [],
+    "percentage_tolerance": 0.15,
+    "caption_start": 1,
+    "custom_terms": {
+      "心梗": "心肌梗死"
+    },
+    "description": "收紧百分比复算容差至 0.15 个百分点，并启用心血管定制术语提示。"
+  },
+  {
+    "id": "core-math-only",
+    "name": "仅核心数学与结构核验",
+    "version": "1.0.0",
+    "discipline": "medical",
+    "enabled_scopes": ["professional", "journal"],
+    "disabled_rules": ["STA-SIGNIF", "STA-LOWERP", "STA-CHI", "STA-SE", "STA-METHOD"],
+    "percentage_tolerance": 0.5,
+    "caption_start": 1,
+    "custom_terms": {},
+    "description": "仅启用 P 值范围、百分比复算与图表题注顺序，演示禁用规则仍显式保留任务记录。"
+  }
+]

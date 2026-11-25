@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>中文科技期刊智能审校能力平台 · 编辑工作台</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>中文科技期刊智能审校能力平台</h1>
+      <span class="badge" id="version-badge">V0.1</span>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="workbench">审校工作台</button>
+      <button class="tab" data-tab="registry">规则库与知识依据</button>
+      <button class="tab" data-tab="evaluation">评估反馈统计</button>
+    </nav>
+  </header>
+
+  <main class="container">
+    <!-- Tab 1: Workbench -->
+    <section id="tab-workbench" class="tab-panel active">
+      <div class="control-bar card">
+        <div class="field">
+          <label for="journal-select">期刊配置包</label>
+          <select id="journal-select"></select>
+        </div>
+        <div class="field">
+          <label for="docx-input">上传待审校 DOCX 稿件</label>
+          <input type="file" id="docx-input" accept=".docx" />
+        </div>
+        <div class="actions">
+          <button id="run-btn" class="btn primary">开始审校</button>
+          <button id="load-run-btn" class="btn secondary">刷新当前记录</button>
+        </div>
+      </div>
+
+      <div id="status-banner" class="banner hidden"></div>
+
+      <div id="run-overview" class="hidden">
+        <div class="metrics-row">
+          <div class="metric-card"><span class="m-label">运行 ID</span><strong id="m-run-id">-</strong></div>
+          <div class="metric-card"><span class="m-label">稿件块数 / 字数</span><strong id="m-doc-stats">-</strong></div>
+          <div class="metric-card"><span class="m-label">DAG 任务数</span><strong id="m-task-stats">-</strong></div>
+          <div class="metric-card"><span class="m-label">核验后意见</span><strong id="m-finding-stats">-</strong></div>
+        </div>
+
+        <div class="export-bar card">
+          <div class="export-left">
+            <span class="hint">导出与 Word 批注写回（批注导出仅包含「已采纳」意见，并校验原稿 SHA-256 指纹）：</span>
+          </div>
+          <div class="export-btns">
+            <button id="export-json-btn" class="btn small">导出 JSON</button>
+            <button id="export-md-btn" class="btn small">导出 Markdown</button>
+            <button id="export-summary-btn" class="btn small">导出综合报告 DOCX</button>
+            <button id="export-word-btn" class="btn small primary">下载原生批注 DOCX</button>
+          </div>
+        </div>
+
+        <div class="workspace-grid">
+          <!-- Left: Document IR Preview -->
+          <div class="card doc-pane">
+            <div class="pane-header">
+              <h2>Document IR 原文视图</h2>
+              <span id="doc-profile-tag" class="tag"></span>
+            </div>
+            <div id="doc-blocks" class="doc-blocks"></div>
+          </div>
+
+          <!-- Right: Findings & Adjudication -->
+          <div class="card findings-pane">
+            <div class="pane-header">
+              <h2>审校意见与编辑裁决</h2>
+              <div class="filter-group">
+                <select id="filter-decision">
+                  <option value="all">全部状态</option>
+                  <option value="pending">待裁决</option>
+                  <option value="accept">已采纳</option>
+                  <option value="reject">已驳回</option>
+                  <option value="defer">暂缓</option>
+                </select>
+              </div>
+            </div>
+            <div class="editor-bar">
+              <label for="editor-name">编辑署名：</label>
+              <input id="editor-name" type="text" value="责编-王编辑" />
+            </div>
+            <div id="findings-list" class="findings-list"></div>
+          </div>
+        </div>
+
+        <details class="card plan-details">
+          <summary>查看 Router DAG 任务执行明细（零静默遗漏验证）</summary>
+          <div id="plan-table-wrap"></div>
+        </details>
+      </div>
+    </section>
+
+    <!-- Tab 2: Registry & Knowledge -->
+    <section id="tab-registry" class="tab-panel">
+      <div class="card">
+        <h2>版本化规则注册表 & 结构化规范依据</h2>
+        <p class="hint">所有规则逻辑与依据条款均由后端 Knowledge Engine / Rule Registry 统一注册，严禁硬编码于前端或大模型 Prompt 中。</p>
+        <div id="registry-content"></div>
+      </div>
+    </section>
+
+    <!-- Tab 3: Evaluation Feedback -->
+    <section id="tab-evaluation" class="tab-panel">
+      <div class="card">
+        <h2>编辑裁决反馈与质量评估队列</h2>
+        <p class="hint">编辑裁决反馈自动落入评估队列，供黄金测试与误漏报分析使用，不直接篡改正式规则。</p>
+        <div id="eval-content"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

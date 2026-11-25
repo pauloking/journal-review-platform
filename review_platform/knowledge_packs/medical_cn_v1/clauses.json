@@ -1,0 +1,101 @@
+[
+  {
+    "id": "STD-GBT15835-2011",
+    "source": "GB/T 15835-2011《出版物上数字用法》",
+    "edition": "2011",
+    "clause": "第4~5章 阿拉伯数字与数值范围表示",
+    "scope": "national",
+    "summary": "数值范围一般采用波浪号「～」连接；百分数范围两端均应加「%」；纯小数前零不可省略；多位数字按3位空1/4汉字分节。",
+    "effective_date": "2011-11-01"
+  },
+  {
+    "id": "STD-GB3100-3102",
+    "source": "GB 3100~3102-1993《量和单位》",
+    "edition": "1993",
+    "clause": "法定计量单位与 SI 词头使用规范",
+    "scope": "national",
+    "summary": "禁止使用 ppm/ppb/ppt/rpm/cal/M/Eq 等非标准符号，单位符号不用复数、词头不重叠；mmHg/cmH2O 需注明与 kPa 换算。",
+    "effective_date": "1994-07-01"
+  },
+  {
+    "id": "STD-GBT15834-2011",
+    "source": "GB/T 15834-2011《标点符号用法》",
+    "edition": "2011",
+    "clause": "第4章 中文标点全角与省略号规范",
+    "scope": "national",
+    "summary": "中文语境句内点号应使用全角标点；省略号为六点「……」，不得以三个或以上英文句点替代。",
+    "effective_date": "2012-06-01"
+  },
+  {
+    "id": "STD-GBT7714-2025",
+    "source": "GB/T 7714-2025《信息与文献 参考文献著录规则》",
+    "edition": "2025",
+    "clause": "第4~7章 文献类型标志与页码连接符号",
+    "scope": "national",
+    "summary": "文后参考文献须标注规范文献类型标志（如[J][M][D]），起止页码范围使用半字线「-」连接。",
+    "effective_date": "2026-07-01"
+  },
+  {
+    "id": "STD-CNTERM-COMM",
+    "source": "全国科学技术名词审定委员会《医学名词》",
+    "edition": "现行审定版",
+    "clause": "规范医学名词与废弃/俗称对照",
+    "scope": "professional",
+    "summary": "学术论文正文应使用审定规范名词（如心肌梗死、脑梗死、脑出血、梅尼埃病、综合征、适应证等），避免旧称或错别字。",
+    "effective_date": ""
+  },
+  {
+    "id": "STD-GB3358-STATS",
+    "source": "GB/T 3358《统计学词汇及符号》及中华医学会系列杂志统计学表述规范",
+    "edition": "2009",
+    "clause": "统计学符号大小写与差异显著性表述",
+    "scope": "professional",
+    "summary": "P 值用大写斜体 P，避免使用「显著性差异/差异显著」旧表述（改用「差异有统计学意义」），χ² 规范书写并注明检验方法。",
+    "effective_date": ""
+  },
+  {
+    "id": "LOCAL-MATH-PRANGE",
+    "source": "医学期刊统计学数学一致性基线约定",
+    "edition": "platform-v1",
+    "clause": "概率值闭区间约束 [0, 1]",
+    "scope": "professional",
+    "summary": "显式报告的 P 值及检验水准阈值必须位于数学闭区间 [0, 1] 内，小于 0 或大于 1 属于数值异常。",
+    "effective_date": "2026-11-25"
+  },
+  {
+    "id": "LOCAL-MATH-PERCENTAGE",
+    "source": "医学期刊数值核对基线约定",
+    "edition": "platform-v1",
+    "clause": "频数百分比 n/N(pct%) 复算一致性",
+    "scope": "professional",
+    "summary": "正文与表格中的 n/N(pct%) 表达式须满足分子分母非负、N>0、一般 n<=N，且报告百分比与 Decimal(n)/Decimal(N)*100 在显示精度半单位与期刊容差范围内一致。",
+    "effective_date": "2026-11-25"
+  },
+  {
+    "id": "LOCAL-STRUCT-CAPTION",
+    "source": "中文科技期刊图表编排体例约定",
+    "edition": "platform-v1",
+    "clause": "图表题注独立连续编号",
+    "scope": "journal",
+    "summary": "文内段首「图X」「表X」题注应各自独立从起始号连续递增，不得跳号或重复编号；正文交叉引用不视作题注。",
+    "effective_date": "2026-11-25"
+  },
+  {
+    "id": "JOU-STYLE-GUIDE",
+    "source": "目标医学期刊投稿须知与编辑部体例",
+    "edition": "platform-v1",
+    "clause": "稿件体例与伦理人工核对清单",
+    "scope": "journal",
+    "summary": "涵盖结构式摘要、三线表、图片分辨率、伦理批件号、知情同意与检验水准声明等人工核对项。",
+    "effective_date": "2026-11-25"
+  },
+  {
+    "id": "EXP-EDITORIAL-GUIDE",
+    "source": "医学期刊编校经验与合规风险提示",
+    "edition": "platform-v1",
+    "clause": "广告法禁用词、隐私脱敏与涉密提示",
+    "scope": "experience",
+    "summary": "默认仅作提示级人工复核参考，不自动触发强制报错，防止误伤客观学术专名。",
+    "effective_date": "2026-11-25"
+  }
+]
