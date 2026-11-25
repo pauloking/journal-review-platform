@@ -39,3 +39,4 @@ python -m uvicorn review_platform.api:create_app --factory --host 127.0.0.1 --po
 - [docs/EVALUATION.md](docs/EVALUATION.md) — 质量评估指标与回归测试体系
 - [docs/ROADMAP.md](docs/ROADMAP.md) — V0.1 ~ V1.0 演进路线
 - [docs/EXISTING_PROJECT_AUDIT.md](docs/EXISTING_PROJECT_AUDIT.md) — 原有医学审校项目核查与复用记录
+- [docs/AGENT_DESIGN_SPEC.md](docs/AGENT_DESIGN_SPEC.md) — 当前版本智能体设计书（背景/场景/框架/路线/资源/效果/伦理合规）
