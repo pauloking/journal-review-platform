@@ -146,6 +146,12 @@ class KnowledgeEngine:
     def list_documents(self) -> list[KnowledgeDocument]:
         return list(self._documents.values())
 
+    def doc_for_basis(self, basis_id: str) -> Optional[KnowledgeDocument]:
+        for doc in self._documents.values():
+            if basis_id == doc.basis_id or basis_id in (doc.basis_ids or []):
+                return doc
+        return None
+
     def get_clause(self, basis_id: str) -> Optional[KnowledgeClause]:
         return self._clauses.get(basis_id)
 

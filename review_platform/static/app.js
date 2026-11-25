@@ -118,11 +118,61 @@ async function init() {
 
   document.getElementById('doc-search-input').addEventListener('input', renderDocumentList);
   document.getElementById('new-doc-btn').addEventListener('click', () => openDocumentEditor(null));
+  document.getElementById('upload-doc-btn').addEventListener('click', () => {
+    document.getElementById('rule-doc-upload').click();
+  });
+  document.getElementById('rule-doc-upload').addEventListener('change', handleRuleDocUpload);
+
+  document.querySelectorAll('.subtab').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.subtab').forEach((b) => b.classList.remove('active'));
+      document.querySelectorAll('.subtab-panel').forEach((p) => p.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById('subtab-' + btn.dataset.subtab).classList.add('active');
+    });
+  });
 
   const hashRun = new URLSearchParams(location.search).get('run_id');
   if (hashRun) {
     await loadRunById(hashRun);
   }
+}
+
+async function handleRuleDocUpload(ev) {
+  const file = ev.target.files?.[0];
+  ev.target.value = '';
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  showBanner(`正在解析规范文档「${file.name}」...`);
+  const res = await fetch('/knowledge/documents/parse', { method: 'POST', body: fd });
+  const data = await res.json();
+  if (!res.ok) {
+    showBanner(data.detail || '规则文档解析失败', true);
+    return;
+  }
+  showBanner(`已解析「${data.filename}」，识别 ${data.rules.length} 条规则，请检查正反例后保存激活。`);
+  openDocumentEditor(null, data);
+}
+
+function renderLivePipelineProgress(activeIdx) {
+  const card = document.getElementById('pipeline-viz-card');
+  card.classList.remove('hidden');
+  const stages = [
+    '① DOCX 解析 → Document IR',
+    '② 装载规范文档与期刊配置',
+    '③ Router DAG 拓扑编排',
+    '④ FactLedger 事实抽取',
+    '⑤ 按规范文档执行规则',
+    '⑥ 锚点与依据门禁核验',
+  ];
+  document.getElementById('pipeline-stepper').innerHTML = stages
+    .map((label, idx) => {
+      const cls = idx < activeIdx ? 'done' : idx === activeIdx ? 'running' : '';
+      const txt = idx < activeIdx ? '已完成' : idx === activeIdx ? '正在执行…' : '等待中';
+      return `<div class="step-node ${cls}"><div class="step-title">${esc(label)}</div><div class="step-summary">${txt}</div></div>`;
+    })
+    .join('');
 }
 
 async function runReview() {
@@ -137,8 +187,18 @@ async function runReview() {
   const fd = new FormData();
   fd.append('file', file);
 
-  showBanner('正在解析 Document IR、生成 Router DAG 并执行确定性规则...');
+  showBanner('正在执行审校流水线...');
+  let stageTick = 0;
+  renderLivePipelineProgress(0);
+  const timer = setInterval(() => {
+    if (stageTick < 5) {
+      stageTick++;
+      renderLivePipelineProgress(stageTick);
+    }
+  }, 180);
+
   const res = await fetch(`/reviews?journal=${encodeURIComponent(journal)}`, { method: 'POST', body: fd });
+  clearInterval(timer);
   const data = await res.json();
   if (!res.ok) {
     showBanner(data.detail || '审校执行失败', true);
@@ -148,7 +208,7 @@ async function runReview() {
   selectedAnchor = null;
   history.replaceState(null, '', `?run_id=${encodeURIComponent(data.run_id)}`);
   renderRun();
-  showBanner(`审校完成：共生成 ${data.findings.length} 条可验证意见`);
+  showBanner(`审校完成：共执行 ${data.plan.tasks.length} 个任务节点，生成 ${data.findings.length} 条可验证意见`);
 }
 
 async function loadRunById(runId) {
@@ -180,6 +240,7 @@ function latestDecisionsMap() {
 
 function renderRun() {
   if (!currentRun) return;
+  document.getElementById('pipeline-viz-card').classList.remove('hidden');
   document.getElementById('run-overview').classList.remove('hidden');
   document.getElementById('m-run-id').textContent = currentRun.run_id;
   const p = currentRun.document.profile;
@@ -188,9 +249,117 @@ function renderRun() {
   document.getElementById('m-finding-stats').textContent = `${currentRun.findings.length} 条`;
   document.getElementById('doc-profile-tag').textContent = `结构状态: ${p.structure_status}`;
 
+  renderPipelineVisualization();
   renderDocumentBlocks();
   renderFindings();
-  renderPlanTable();
+}
+
+function renderPipelineVisualization() {
+  const trace = currentRun.trace || [];
+  const findStage = (st) => trace.find((x) => x.stage === st);
+  const ruleSteps = trace.filter((x) => x.stage === 'rule_execute');
+  const stageCards = [
+    { key: 'document_parse', label: '① DOCX 解析 → Document IR', item: findStage('document_parse') },
+    { key: 'knowledge_bind', label: '② 规范文档装载', item: findStage('knowledge_bind') },
+    { key: 'router_plan', label: '③ Router DAG 编排', item: findStage('router_plan') },
+    { key: 'fact_extract', label: '④ FactLedger 事实抽取', item: findStage('fact_extract') },
+    {
+      key: 'rule_execute',
+      label: '⑤ 按规范文档执行',
+      item: {
+        status: ruleSteps.some((r) => r.status === 'failed') ? 'failed' : 'completed',
+        summary: `已核验 ${ruleSteps.length} 份规范文档`,
+      },
+    },
+    { key: 'finding_gate', label: '⑥ 锚点与依据门禁', item: findStage('finding_gate') },
+  ];
+
+  document.getElementById('pipeline-stepper').innerHTML = stageCards
+    .map((s) => {
+      const st = s.item?.status || 'completed';
+      const cls = st === 'failed' ? 'failed' : 'done';
+      return `<div class="step-node ${cls}">
+        <div class="step-title">${esc(s.label)}</div>
+        <div class="step-summary">${esc(s.item?.summary || '已完成')}</div>
+      </div>`;
+    })
+    .join('');
+
+  // Subtab 1: 按规范文档追踪执行情况
+  document.getElementById('subtab-doc-trace').innerHTML = `<div class="doc-trace-grid">${ruleSteps
+    .map((step) => {
+      const rules = step.details?.rules || [];
+      const hits = rules.reduce((a, b) => a + (b.findings || 0), 0);
+      const pill =
+        step.status === 'skipped'
+          ? '<span class="pill-skip">未启用/人工清单</span>'
+          : hits > 0
+            ? `<span class="pill-hit">命中 ${hits} 条</span>`
+            : '<span class="pill-ok">核验通过 (0 问题)</span>';
+      const detailRows = rules
+        .map(
+          (r) => `<tr><td><code>${esc(r.rule_id)}</code></td><td><code>${esc(r.status)}</code></td><td>${r.checked}</td><td>${r.excluded}</td><td>${r.findings}</td><td>${esc(r.reason)}</td></tr>`
+        )
+        .join('');
+      return `<div class="doc-trace-card">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
+          <b>${esc(step.title.replace(/^执行规范文档：/, ''))}</b>
+          ${pill}
+        </div>
+        <div class="hint">${esc(step.summary)}</div>
+        <details><summary>展开本文档逐条规则执行明细</summary>
+          <table><tr><th>规则</th><th>状态</th><th>检查</th><th>豁免</th><th>命中</th><th>说明</th></tr>${detailRows}</table>
+        </details>
+      </div>`;
+    })
+    .join('')}</div>`;
+
+  // Subtab 2: FactLedger 事实台账
+  const facts = currentRun.facts || [];
+  const factRows = facts
+    .map(
+      (f) => `<tr>
+      <td><code>${esc(f.kind)}</code></td>
+      <td><code>${esc(f.anchor.block_id)}</code></td>
+      <td><b>${esc(f.anchor.quote)}</b></td>
+      <td><code>${esc(JSON.stringify(f.values))}</code></td>
+      <td>${f.status === 'excluded' ? `<span class="pill-skip">已豁免 (${esc(f.exclusion_reason || '')})</span>` : '<span class="pill-ok">已纳入核验</span>'}</td>
+    </tr>`
+    )
+    .join('');
+  document.getElementById('subtab-fact-ledger').innerHTML = facts.length
+    ? `<table><tr><th>事实类型</th><th>所在块</th><th>原文切片</th><th>解析值</th><th>台账状态</th></tr>${factRows}</table>`
+    : '<p class="hint">本稿件未抽取到 P 值、百分比或题注事实。</p>';
+
+  // Subtab 3: Router DAG 任务全量表
+  const rows = currentRun.plan.tasks
+    .map(
+      (t) => `<tr>
+      <td><code>${esc(t.node_id)}</code></td>
+      <td><code>${esc(t.doc_id || '-')}</code></td>
+      <td>${esc(t.category)}</td>
+      <td><code>${esc(t.status)}</code></td>
+      <td>${t.checked_count}</td>
+      <td>${t.excluded_count}</td>
+      <td>${t.finding_count}</td>
+      <td>${esc(t.reason)}</td>
+    </tr>`
+    )
+    .join('');
+  document.getElementById('subtab-dag-tasks').innerHTML = `<table>
+    <tr><th>节点</th><th>所属规范文档</th><th>类别</th><th>状态</th><th>检查数</th><th>排除数</th><th>命中数</th><th>说明</th></tr>
+    ${rows}
+  </table>`;
+
+  // Subtab 4: 时序日志
+  document.getElementById('subtab-timeline-trace').innerHTML = `<table>
+    <tr><th>#</th><th>阶段</th><th>步骤</th><th>状态</th><th>耗时(ms)</th><th>执行摘要</th></tr>
+    ${trace
+      .map(
+        (s) => `<tr><td>${s.step_index}</td><td><code>${esc(s.stage)}</code></td><td>${esc(s.title)}</td><td><code>${esc(s.status)}</code></td><td>${s.duration_ms}</td><td>${esc(s.summary)}</td></tr>`
+      )
+      .join('')}
+  </table>`;
 }
 
 function renderDocumentBlocks() {
@@ -460,24 +629,27 @@ function renderDocumentViewer(doc) {
 let editingRulesBuffer = [];
 let editingDocId = null;
 
-window.openDocumentEditor = function (docId) {
+window.openDocumentEditor = function (docId, parsedPreview = null) {
   const doc = docId ? (registryData?.documents || []).find((d) => d.doc_id === docId) : null;
   editingDocId = doc ? doc.doc_id : null;
-  editingRulesBuffer = doc
-    ? JSON.parse(JSON.stringify(doc.maintainable_rules || []))
-    : [
-        {
-          rule_id: 'CUST-TERM-01',
-          nonstandard: '',
-          standard: '',
-          severity: 'warning',
-          is_regex: false,
-          exception_after: [],
-          example: '',
-          counter_example: '',
-          description: '',
-        },
-      ];
+  const srcObj = parsedPreview || doc;
+  editingRulesBuffer = parsedPreview
+    ? JSON.parse(JSON.stringify(parsedPreview.rules || []))
+    : doc
+      ? JSON.parse(JSON.stringify(doc.maintainable_rules || []))
+      : [
+          {
+            rule_id: 'CUST-TERM-01',
+            nonstandard: '',
+            standard: '',
+            severity: 'warning',
+            is_regex: false,
+            exception_after: [],
+            example: '',
+            counter_example: '',
+            description: '',
+          },
+        ];
 
   const viewer = document.getElementById('doc-viewer');
   const editor = document.getElementById('doc-editor');
@@ -485,11 +657,14 @@ window.openDocumentEditor = function (docId) {
   editor.classList.remove('hidden');
 
   const canEditRules = !doc || doc.supports_rule_editing;
+  const parseBanner = parsedPreview
+    ? `<div class="banner">${esc((parsedPreview.parse_notes || []).join(' '))}</div>`
+    : '';
 
   editor.innerHTML = `
     <div class="doc-header">
       <div>
-        <h2>${doc ? `维护文档：${esc(doc.title)}` : '新建规范文档'}</h2>
+        <h2>${doc ? `维护文档：${esc(doc.title)}` : parsedPreview ? `确认导入：${esc(parsedPreview.filename)}` : '新建规范文档'}</h2>
         <p class="hint">保存前系统会自动校验每条规则的正反例（必须命中错例且不误报正例），通过后方才激活生效。</p>
       </div>
       <div class="actions">
@@ -497,22 +672,23 @@ window.openDocumentEditor = function (docId) {
         <button class="btn small primary" onclick="saveKnowledgeDocument()">验证正反例并保存</button>
       </div>
     </div>
+    ${parseBanner}
     <div id="doc-editor-error" class="banner error hidden"></div>
     <div class="editor-grid">
-      <div class="editor-field"><label>文档标题</label><input id="ed-title" value="${esc(doc?.title || '')}" placeholder="例如：《心血管专科术语补充规范》" /></div>
-      <div class="editor-field"><label>依据来源</label><input id="ed-source" value="${esc(doc?.source || '')}" placeholder="例如：本刊编辑部规范 v2026" /></div>
-      <div class="editor-field"><label>版本年份</label><input id="ed-edition" value="${esc(doc?.edition || '2026')}" /></div>
+      <div class="editor-field"><label>文档标题</label><input id="ed-title" value="${esc(srcObj?.title || '')}" placeholder="例如：《心血管专科术语补充规范》" /></div>
+      <div class="editor-field"><label>依据来源</label><input id="ed-source" value="${esc(srcObj?.source || '')}" placeholder="例如：本刊编辑部规范 v2026" /></div>
+      <div class="editor-field"><label>版本年份</label><input id="ed-edition" value="${esc(srcObj?.edition || '2026')}" /></div>
       <div class="editor-field"><label>规范层级</label>
         <select id="ed-scope">
-          <option value="national" ${doc?.scope === 'national' ? 'selected' : ''}>国家标准</option>
-          <option value="professional" ${doc?.scope === 'professional' ? 'selected' : ''}>行业规范</option>
-          <option value="journal" ${!doc || doc.scope === 'journal' ? 'selected' : ''}>期刊体例</option>
-          <option value="experience" ${doc?.scope === 'experience' ? 'selected' : ''}>编辑经验</option>
+          <option value="national" ${srcObj?.scope === 'national' ? 'selected' : ''}>国家标准</option>
+          <option value="professional" ${srcObj?.scope === 'professional' ? 'selected' : ''}>行业规范</option>
+          <option value="journal" ${!srcObj || srcObj.scope === 'journal' ? 'selected' : ''}>期刊体例</option>
+          <option value="experience" ${srcObj?.scope === 'experience' ? 'selected' : ''}>编辑经验</option>
         </select>
       </div>
     </div>
-    <div class="editor-field"><label>核心摘要</label><input id="ed-summary" value="${esc(doc?.summary || '')}" placeholder="简要描述本规范文档的适用目标" /></div>
-    <div class="editor-field"><label>规范文档正文（Markdown）</label><textarea id="ed-md" rows="10">${esc(doc?.body_markdown || '# 新建规范文档\n\n## 1. 适用范围\n\n## 2. 编校要求\n')}</textarea></div>
+    <div class="editor-field"><label>核心摘要</label><input id="ed-summary" value="${esc(srcObj?.summary || '')}" placeholder="简要描述本规范文档的适用目标" /></div>
+    <div class="editor-field"><label>规范文档正文（Markdown）</label><textarea id="ed-md" rows="10">${esc(srcObj?.body_markdown || '# 新建规范文档\n\n## 1. 适用范围\n\n## 2. 编校要求\n')}</textarea></div>
     <div class="doc-rules-section">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
         <h3 style="margin:0;">可执行规则条目${canEditRules ? '' : '（数学/结构 Python 内置验证器，此处仅维护文档说明）'}</h3>

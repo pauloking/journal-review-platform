@@ -102,3 +102,72 @@ def test_document_upsert_validation_gate_and_live_review(tmp_path: Path):
     ).json()
     hit_ids = {f["rule_id"] for f in rev["findings"]}
     assert "CUST-CABG-01" in hit_ids
+
+    # 4. 验证运行时完整可视化中间过程 trace 含新文档的执行记录
+    stages = [s["stage"] for s in rev["trace"]]
+    for expected_stage in ("document_parse", "knowledge_bind", "router_plan", "fact_extract", "rule_execute", "finding_gate"):
+        assert expected_stage in stages
+    custom_trace = next(s for s in rev["trace"] if s.get("doc_id") == created_doc["doc_id"])
+    assert "命中 1 条" in custom_trace["summary"]
+
+
+def test_upload_and_parse_markdown_and_docx_rule_documents(tmp_path: Path):
+    client = TestClient(create_app(db_path=tmp_path / "parse_docs.sqlite3"))
+
+    # 1. 上传 .md 规则文档自动解析箭头与表格规则
+    md_bytes = (
+        "# 本刊心血管术语补充规范 2026\n"
+        "来源：心血管编辑部体例\n\n"
+        "- 心脏搭桥 -> 冠状动脉旁路移植术\n\n"
+        "| 非规范 | 规范写法 | 说明 |\n"
+        "| --- | --- | --- |\n"
+        "| 支架内再狭窄率高 | 支架内再狭窄发生率升高 | 避免口语化 |\n"
+    ).encode("utf-8")
+    res_md = client.post(
+        "/knowledge/documents/parse",
+        files={"file": ("cardio-rules.md", md_bytes, "text/markdown")},
+    )
+    assert res_md.status_code == 200
+    parsed_md = res_md.json()
+    assert parsed_md["title"] == "本刊心血管术语补充规范 2026"
+    assert len(parsed_md["rules"]) == 2
+    assert parsed_md["rules"][0]["nonstandard"] == "心脏搭桥"
+    assert parsed_md["rules"][0]["standard"] == "冠状动脉旁路移植术"
+
+    # 2. 上传 .docx 规则文档（含表格）自动解析并保存激活后立即在审校中命中
+    docx_bytes = make_docx_bytes(
+        paragraphs=["《检验医学符号补充规范 2026》", "来源：检验编辑部"],
+        tables=[[["非规范写法", "规范写法", "说明"], ["血沉", "红细胞沉降率", "全文统一使用规范中文全称"]]],
+    )
+    res_docx = client.post(
+        "/knowledge/documents/parse",
+        files={"file": ("lab-rules.docx", docx_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    assert res_docx.status_code == 200
+    parsed_docx = res_docx.json()
+    assert len(parsed_docx["rules"]) == 1
+    assert parsed_docx["rules"][0]["nonstandard"] == "血沉"
+
+    save_res = client.post(
+        "/knowledge/documents",
+        json={
+            "title": parsed_docx["title"],
+            "source": parsed_docx["source"],
+            "edition": parsed_docx["edition"],
+            "scope": parsed_docx["scope"],
+            "summary": parsed_docx["summary"],
+            "body_markdown": parsed_docx["body_markdown"],
+            "rules": parsed_docx["rules"],
+        },
+    )
+    assert save_res.status_code == 200
+    saved_doc = save_res.json()
+
+    # 用带「血沉」的稿件跑一次审校，确认按解析后的新文档规则实际执行
+    ms_bytes = make_docx_bytes(["检验研究", "摘要：检测患者血沉指标变化。"])
+    rev = client.post(
+        "/reviews?journal=general-medical-cn",
+        files={"file": ("ms.docx", ms_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    ).json()
+    assert any(f["basis_id"] == saved_doc["basis_id"] for f in rev["findings"])
+

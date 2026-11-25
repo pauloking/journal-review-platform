@@ -24,7 +24,14 @@ from review_platform.editorial_engine import (
     export_markdown,
 )
 from review_platform.evaluation_engine import summarize_feedback_stats
-from review_platform.models import DecisionRequest, DocumentUpsertRequest, KnowledgeDocument, ReviewRun
+from review_platform.knowledge_engine import parse_rule_document_bytes
+from review_platform.models import (
+    DecisionRequest,
+    DocumentUpsertRequest,
+    KnowledgeDocument,
+    ParsedRuleDocumentPreview,
+    ReviewRun,
+)
 from review_platform.pipeline import PlatformContext
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -91,6 +98,14 @@ def create_app(db_path: Optional[str | Path] = None) -> FastAPI:
             media_type="text/markdown; charset=utf-8",
             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}"},
         )
+
+    @app.post("/knowledge/documents/parse", response_model=ParsedRuleDocumentPreview)
+    async def parse_uploaded_rule_document(file: UploadFile = File(...)) -> ParsedRuleDocumentPreview:
+        raw_bytes = await file.read()
+        try:
+            return parse_rule_document_bytes(raw_bytes, filename=file.filename or "rules.md")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/knowledge/documents", response_model=KnowledgeDocument)
     def create_knowledge_document(req: DocumentUpsertRequest) -> KnowledgeDocument:

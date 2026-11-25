@@ -6,6 +6,9 @@ import hashlib
 import heapq
 import json
 
+from typing import Optional
+
+from review_platform.knowledge_engine import KnowledgeEngine
 from review_platform.models import (
     DocumentIR,
     ExecutionPlan,
@@ -24,6 +27,7 @@ def build_execution_plan(
     document: DocumentIR,
     journal: JournalProfile,
     registry: RuleRegistry,
+    knowledge: Optional[KnowledgeEngine] = None,
 ) -> ExecutionPlan:
     """根据稿件画像、期刊配置和规则注册表生成确定性 DAG 计划。"""
     for disabled_id in journal.disabled_rules:
@@ -101,6 +105,7 @@ def build_execution_plan(
             status = "skipped"
             reason = "no_applicable_sections"
 
+        doc_obj = (knowledge or registry.knowledge).doc_for_basis(rule.basis_id)
         tasks.append(
             ReviewTask(
                 node_id=rule.id,
@@ -109,6 +114,8 @@ def build_execution_plan(
                 title=rule.title,
                 category=rule.category,
                 scope=rule.scope,
+                basis_id=rule.basis_id,
+                doc_id=doc_obj.doc_id if doc_obj else "",
                 dependencies=list(rule.dependencies),
                 status=status,
                 reason=reason,

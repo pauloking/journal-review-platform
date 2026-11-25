@@ -219,12 +219,49 @@ class ReviewTask(BaseModel):
     title: str
     category: str
     scope: ScopeType
+    basis_id: str = ""
+    doc_id: str = ""
     dependencies: list[str] = Field(default_factory=list)
     status: TaskStatus = "pending"
     reason: str = ""
     checked_count: int = 0
     excluded_count: int = 0
     finding_count: int = 0
+
+
+class ExecutionTraceStep(BaseModel):
+    """平台运行时可视化中间过程追踪事件。"""
+
+    step_index: int
+    stage: Literal[
+        "document_parse",
+        "knowledge_bind",
+        "router_plan",
+        "fact_extract",
+        "rule_execute",
+        "finding_gate",
+    ]
+    title: str
+    status: Literal["completed", "skipped", "failed", "blocked"] = "completed"
+    doc_id: str = ""
+    node_id: str = ""
+    duration_ms: float = 0.0
+    summary: str = ""
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ParsedRuleDocumentPreview(BaseModel):
+    """上传规则文档后的自动解析预览结果（未直接生效，待正反例校验后保存）。"""
+
+    filename: str
+    title: str
+    source: str
+    edition: str
+    scope: ScopeType
+    summary: str
+    body_markdown: str
+    rules: list[MaintainableTermRule] = Field(default_factory=list)
+    parse_notes: list[str] = Field(default_factory=list)
 
 
 class ExecutionPlan(BaseModel):
@@ -296,3 +333,4 @@ class ReviewRun(BaseModel):
     findings: list[Finding]
     rejected_candidates: list[dict[str, Any]] = Field(default_factory=list)
     decisions: list[EditorialDecision] = Field(default_factory=list)
+    trace: list[ExecutionTraceStep] = Field(default_factory=list)

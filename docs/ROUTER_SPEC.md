@@ -29,3 +29,7 @@ Router 负责根据 `ManuscriptProfile`、`JournalProfile` 与 `RuleRegistry` �
 - `skipped`：因配置禁用、人工清单或无适用章节跳过（必带 `reason`）；
 - `failed`：执行期发生异常（保留错误诊断）；
 - `blocked`：至少一个前置依赖状态为 `failed` 或 `blocked`，被安全阻断。
+
+## 5. 可视化中间过程追踪（`ExecutionTraceStep`）
+
+每次运行在 `ReviewRun.trace` 中按时间顺序产出 6 阶段可验证追踪事件（`document_parse` → `knowledge_bind` → `router_plan` → `fact_extract` → 按规范文档分组的 `rule_execute` → `finding_gate`），并在前端工作台以流水线步进条、按文档执行卡片、FactLedger 事实台账（含被豁免项及理由）与全量 DAG 任务表直观呈现，确保每条规则实际被执行或跳过均可审计。

@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,7 @@ from review_platform.finding_engine import govern_findings
 from review_platform.knowledge_engine import KnowledgeEngine
 from review_platform.models import (
     DocumentUpsertRequest,
+    ExecutionTraceStep,
     KnowledgeClause,
     KnowledgeDocument,
     ReviewRun,
@@ -198,9 +200,69 @@ class PlatformContext:
         journal_id: str = "general-medical-cn",
         fail_nodes: Optional[set[str]] = None,
     ) -> ReviewRun:
+        trace: list[ExecutionTraceStep] = []
+
+        t0 = time.perf_counter()
         doc_ir = parse_docx_bytes(raw_docx, filename=filename)
+        dt_parse = round((time.perf_counter() - t0) * 1000, 2)
+        trace.append(
+            ExecutionTraceStep(
+                step_index=1,
+                stage="document_parse",
+                title="DOCX 安全解析 → Document IR",
+                status="completed",
+                duration_ms=dt_parse,
+                summary=f"提取 {doc_ir.profile.total_blocks} 个文本块（{doc_ir.profile.char_count} 字），结构状态：{doc_ir.profile.structure_status}",
+                details={
+                    "document_id": doc_ir.document_id,
+                    "sections": doc_ir.profile.sections_present,
+                    "paragraph_count": doc_ir.profile.paragraph_count,
+                    "table_cell_count": doc_ir.profile.table_cell_count,
+                },
+            )
+        )
+
+        t1 = time.perf_counter()
         journal = self.knowledge.get_journal(journal_id)
-        plan = build_execution_plan(doc_ir, journal, self.registry)
+        active_docs = self.list_documents()
+        dt_know = round((time.perf_counter() - t1) * 1000, 2)
+        trace.append(
+            ExecutionTraceStep(
+                step_index=2,
+                stage="knowledge_bind",
+                title="装载规范文档与期刊配置",
+                status="completed",
+                duration_ms=dt_know,
+                summary=f"期刊配置「{journal.name}」v{journal.version}，已装载 {len(active_docs)} 份规范文档（快照 {self.registry.snapshot_hash}）",
+                details={
+                    "journal_id": journal.id,
+                    "enabled_scopes": journal.enabled_scopes,
+                    "documents": [
+                        {"doc_id": d.doc_id, "title": d.title, "rule_count": len(d.rule_ids)}
+                        for d in active_docs
+                    ],
+                },
+            )
+        )
+
+        t2 = time.perf_counter()
+        plan = build_execution_plan(doc_ir, journal, self.registry, knowledge=self.knowledge)
+        dt_router = round((time.perf_counter() - t2) * 1000, 2)
+        ready_cnt = sum(1 for t in plan.tasks if t.status == "pending")
+        skip_cnt = sum(1 for t in plan.tasks if t.status == "skipped")
+        trace.append(
+            ExecutionTraceStep(
+                step_index=3,
+                stage="router_plan",
+                title="Router DAG 拓扑编排（零静默遗漏）",
+                status="completed",
+                duration_ms=dt_router,
+                summary=f"共编排 {len(plan.tasks)} 个任务节点：待执行 {ready_cnt}，配置/适用性跳过 {skip_cnt}",
+                details={"plan_hash": plan.plan_hash, "ready": ready_cnt, "skipped": skip_cnt},
+            )
+        )
+
+        t3 = time.perf_counter()
         final_plan, facts, raw_findings, has_failure = execute_plan(
             doc_ir,
             journal,
@@ -209,7 +271,80 @@ class PlatformContext:
             self.knowledge,
             fail_nodes=fail_nodes,
         )
+        dt_exec = round((time.perf_counter() - t3) * 1000, 2)
+
+        extract_task = next((t for t in final_plan.tasks if t.node_id == "extract.facts"), None)
+        trace.append(
+            ExecutionTraceStep(
+                step_index=4,
+                stage="fact_extract",
+                title="FactLedger 事实台账抽取",
+                status="failed" if (extract_task and extract_task.status == "failed") else "completed",
+                node_id="extract.facts",
+                duration_ms=dt_exec,
+                summary=f"抽取显式事实 {len(facts)} 条（其中引号/示例豁免 {sum(1 for f in facts if f.status == 'excluded')} 条）",
+                details={
+                    "p_value_count": sum(1 for f in facts if f.kind == "p_value"),
+                    "percentage_count": sum(1 for f in facts if f.kind == "percentage"),
+                    "caption_count": sum(1 for f in facts if f.kind == "caption"),
+                    "excluded_count": sum(1 for f in facts if f.status == "excluded"),
+                },
+            )
+        )
+
+        # 按规范文档汇总执行轨迹，直观呈现每份规范文档的实际检查情况
+        for doc_obj in active_docs:
+            doc_tasks = [t for t in final_plan.tasks if t.doc_id == doc_obj.doc_id]
+            if not doc_tasks:
+                continue
+            exec_cnt = sum(1 for t in doc_tasks if t.status in {"passed", "findings"})
+            chk_cnt = sum(t.checked_count for t in doc_tasks)
+            exc_cnt = sum(t.excluded_count for t in doc_tasks)
+            hit_cnt = sum(t.finding_count for t in doc_tasks)
+            blocked_cnt = sum(1 for t in doc_tasks if t.status == "blocked")
+            failed_cnt = sum(1 for t in doc_tasks if t.status == "failed")
+            st = "failed" if failed_cnt else ("blocked" if blocked_cnt == len(doc_tasks) else ("skipped" if exec_cnt == 0 else "completed"))
+            trace.append(
+                ExecutionTraceStep(
+                    step_index=len(trace) + 1,
+                    stage="rule_execute",
+                    title=f"执行规范文档：{doc_obj.title}",
+                    status=st,
+                    doc_id=doc_obj.doc_id,
+                    summary=(
+                        f"共 {len(doc_tasks)} 条规则（实际运行 {exec_cnt}），检查 {chk_cnt} 处，"
+                        f"豁免 {exc_cnt} 处，命中 {hit_cnt} 条"
+                    ),
+                    details={
+                        "rules": [
+                            {
+                                "rule_id": t.rule_id,
+                                "status": t.status,
+                                "checked": t.checked_count,
+                                "excluded": t.excluded_count,
+                                "findings": t.finding_count,
+                                "reason": t.reason,
+                            }
+                            for t in doc_tasks
+                        ]
+                    },
+                )
+            )
+
+        t4 = time.perf_counter()
         verified_findings, rejected = govern_findings(doc_ir, self.knowledge, raw_findings)
+        dt_gate = round((time.perf_counter() - t4) * 1000, 2)
+        trace.append(
+            ExecutionTraceStep(
+                step_index=len(trace) + 1,
+                stage="finding_gate",
+                title="FindingEngine 锚点与依据门禁",
+                status="completed",
+                duration_ms=dt_gate,
+                summary=f"门禁核验通过 {len(verified_findings)} 条正式意见，拦截 {len(rejected)} 条不合格候选",
+                details={"verified": len(verified_findings), "rejected": len(rejected)},
+            )
+        )
 
         run_seed = f"{doc_ir.document_id}:{journal.id}:{journal.version}:{final_plan.rule_snapshot_hash}:{PLATFORM_VERSION}"
         run_id = f"run-{hashlib.sha256(run_seed.encode('utf-8')).hexdigest()[:14]}"
@@ -233,4 +368,5 @@ class PlatformContext:
             findings=verified_findings,
             rejected_candidates=rejected,
             decisions=[],
+            trace=trace,
         )
