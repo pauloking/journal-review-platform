@@ -97,5 +97,14 @@
     "scope": "experience",
     "summary": "默认仅作提示级人工复核参考，不自动触发强制报错，防止误伤客观学术专名。",
     "effective_date": "2026-11-25"
+  },
+  {
+    "id": "STD-AI-SEMANTIC-GUIDE",
+    "source": "医学期刊受控 AI 语义审校协议",
+    "edition": "platform-v1",
+    "clause": "受控语义候选核查与锚点门禁规范",
+    "scope": "professional",
+    "summary": "大模型仅针对摘要一致性、方法学设计、图文表逻辑与学术语言产出待裁决候选意见，严禁改写科研数据或编造未登记标准条款，每条意见必须通过原文逐字锚点校验。",
+    "effective_date": "2026-11-26"
   }
 ]

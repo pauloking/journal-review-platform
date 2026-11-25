@@ -6,10 +6,11 @@ import hmac
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+import httpx
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
@@ -34,10 +35,13 @@ from review_platform.models import (
     DecisionRequest,
     DocumentUpsertRequest,
     KnowledgeDocument,
+    LLMConfig,
+    LLMTestResult,
     ParsedRuleDocumentPreview,
     ReviewRun,
 )
 from review_platform.pipeline import PlatformContext
+from review_platform.review_engine import get_llm_env_defaults_public, test_llm_connection
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -88,6 +92,7 @@ def _load_token_map(explicit_tokens: Optional[dict[str, tuple[str, str]]]) -> di
 def create_app(
     db_path: Optional[str | Path] = None,
     api_tokens: Optional[dict[str, tuple[str, str]]] = None,
+    llm_client_factory: Optional[Callable[[float], httpx.Client]] = None,
 ) -> FastAPI:
     app = FastAPI(
         title="中文科技期刊智能审校能力平台",
@@ -217,10 +222,32 @@ def create_app(
         store.save_knowledge_document(doc.doc_id, doc.model_dump_json(), doc.updated_at)
         return doc
 
+    @app.get("/llm/defaults")
+    def get_llm_defaults(_auth=Depends(require_role("viewer"))) -> dict:
+        ai_rules = [
+            {"id": r.id, "title": r.title, "category": r.category}
+            for r in ctx.registry.list_rules()
+            if r.executor_type == "ai_candidate"
+        ]
+        return {
+            **get_llm_env_defaults_public(),
+            "ai_rules": ai_rules,
+        }
+
+    @app.post("/llm/test", response_model=LLMTestResult)
+    async def test_llm_endpoint(
+        req: LLMConfig,
+        _auth=Depends(require_role("editor")),
+    ) -> LLMTestResult:
+        return await run_in_threadpool(
+            test_llm_connection, req, client_factory=llm_client_factory
+        )
+
     @app.post("/reviews", response_model=ReviewRun)
     async def create_review(
         file: UploadFile = File(...),
         journal: str = Query("general-medical-cn"),
+        llm_config: Optional[str] = Form(None),
         _auth=Depends(require_role("editor")),
     ) -> ReviewRun:
         raw_bytes = await _read_upload_limited(file, MAX_FILE_BYTES, "DOCX 稿件")
@@ -229,12 +256,22 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+        parsed_llm: Optional[LLMConfig] = None
+        if llm_config and llm_config.strip():
+            try:
+                parsed_llm = LLMConfig.model_validate_json(llm_config)
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=f"大模型配置 JSON 无效: {exc}") from exc
+
         try:
             run = await run_in_threadpool(
                 ctx.run_review,
                 raw_bytes,
                 file.filename or "manuscript.docx",
                 journal,
+                None,
+                parsed_llm,
+                llm_client_factory,
             )
         except DocumentParseError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

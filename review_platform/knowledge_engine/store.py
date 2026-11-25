@@ -83,6 +83,14 @@ BUILTIN_DOC_MANIFEST: list[dict] = [
         "basis_ids": ["EXP-EDITORIAL-GUIDE"],
         "supports_rule_editing": True,
     },
+    {
+        "doc_id": "DOC-AI-SEMANTIC",
+        "file": "DOC-AI-SEMANTIC.md",
+        "title": "《医学期刊受控 AI 语义审校协议》",
+        "basis_id": "STD-AI-SEMANTIC-GUIDE",
+        "basis_ids": ["STD-AI-SEMANTIC-GUIDE"],
+        "supports_rule_editing": False,
+    },
 ]
 
 

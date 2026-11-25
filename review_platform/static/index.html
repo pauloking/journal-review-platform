@@ -37,6 +37,54 @@
         </div>
       </div>
 
+      <!-- Custom LLM Configuration Card -->
+      <details id="llm-config-card" class="card llm-card">
+        <summary class="llm-summary">
+          <div>
+            <strong>智能大模型审校配置（可选 · 用户自定义 API）</strong>
+            <span id="llm-status-pill" class="pill-skip">未启用（仅确定性规则）</span>
+          </div>
+          <span class="hint">配置保存在当前浏览器，API Key 绝不入库</span>
+        </summary>
+        <div class="llm-body">
+          <div class="llm-toggle-row">
+            <label class="chk-label"><input type="checkbox" id="llm-enabled" /> 启用 AI 语义审校（所有模型意见须经原文锚点与依据门禁校验）</label>
+            <label class="chk-label"><input type="checkbox" id="llm-disable-thinking" checked /> 关闭推理思考链（推荐 GLM/Qwen 推理模型开启防超时）</label>
+          </div>
+          <div class="editor-grid">
+            <div class="editor-field">
+              <label for="llm-provider">模型接口类型</label>
+              <select id="llm-provider">
+                <option value="openai">OpenAI 官方接口</option>
+                <option value="claude">Claude (Anthropic)</option>
+                <option value="custom">自定义兼容接口 (DeepSeek / GLM / Qwen / Ollama / OneAPI)</option>
+              </select>
+            </div>
+            <div class="editor-field">
+              <label for="llm-model">模型名称</label>
+              <input id="llm-model" type="text" placeholder="如 gpt-4o-mini / deepseek-chat / GLM-4-Plus" />
+            </div>
+            <div class="editor-field">
+              <label for="llm-endpoint">接口地址 / Base URL（OpenAI/Claude 可留空用默认官方地址）</label>
+              <input id="llm-endpoint" type="text" placeholder="如 https://api.deepseek.com/v1 或 http://127.0.0.1:11434/v1" />
+            </div>
+            <div class="editor-field">
+              <label for="llm-api-key">API Key（本地 Ollama 可留空）</label>
+              <input id="llm-api-key" type="password" placeholder="sk-..." autocomplete="off" />
+            </div>
+          </div>
+          <div class="llm-dims-row">
+            <span class="hint" style="font-weight:600;">启用语义审校维度：</span>
+            <span id="llm-dims-list" class="llm-dims-list"></span>
+          </div>
+          <div class="actions" style="margin-top:10px;align-items:center;">
+            <button id="llm-test-btn" type="button" class="btn small">测试模型连接</button>
+            <button id="llm-save-btn" type="button" class="btn small primary">保存本地配置</button>
+            <span id="llm-test-result" class="hint"></span>
+          </div>
+        </div>
+      </details>
+
       <div id="status-banner" class="banner hidden"></div>
 
       <!-- Live & Completed Pipeline Visualization -->

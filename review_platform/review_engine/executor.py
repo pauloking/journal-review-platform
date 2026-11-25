@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Optional
+
+import httpx
 
 from review_platform.knowledge_engine import KnowledgeEngine
 from review_platform.models import (
@@ -15,9 +18,11 @@ from review_platform.models import (
     Fact,
     Finding,
     JournalProfile,
+    LLMConfig,
     ReviewTask,
 )
 from review_platform.review_engine.fact_extractor import extract_facts
+from review_platform.review_engine.llm_adapter import resolve_llm_config, run_semantic_rule_with_llm
 from review_platform.review_engine.pattern_executor import execute_pattern_rule
 from review_platform.rule_registry import RuleRegistry
 
@@ -289,19 +294,22 @@ def execute_plan(
     *,
     fact_extractor_fn: Callable[[DocumentIR], list[Fact]] = extract_facts,
     fail_nodes: Optional[set[str]] = None,
+    llm_config: Optional[LLMConfig] = None,
+    llm_client_factory: Optional[Callable[[float], httpx.Client]] = None,
 ) -> tuple[ExecutionPlan, list[Fact], list[Finding], bool]:
-    """按 ExecutionPlan 顺序执行任务，任何节点失败时严格阻断下游依赖节点。"""
+    """按 ExecutionPlan 顺序执行任务，任何节点失败时严格阻断下游依赖节点；支持并发执行受控 AI 语义规则。"""
     fail_set = fail_nodes or set()
+    resolved_llm = resolve_llm_config(llm_config)
     facts: list[Fact] = []
     raw_findings: list[Finding] = []
     task_status: dict[str, str] = {}
     has_failure = False
 
     updated_tasks: list[ReviewTask] = []
+    pending_ai_indices: list[tuple[int, ReviewTask]] = []
 
     for task in plan.tasks:
         t = task.model_copy(deep=True)
-        # 检查前置依赖是否失败或被阻断
         blocked_by = [
             dep for dep in t.dependencies if task_status.get(dep) in {"failed", "blocked"}
         ]
@@ -335,6 +343,24 @@ def execute_plan(
             clause = knowledge.get_clause(rule.basis_id)
             basis_source = clause.source if clause else ""
 
+            if rule.executor_type == "ai_candidate":
+                if not resolved_llm.enabled:
+                    t.status = "skipped"
+                    t.reason = "llm_not_configured"
+                    task_status[t.node_id] = "skipped"
+                    updated_tasks.append(t)
+                    continue
+                if resolved_llm.enabled_rules and rule.id not in resolved_llm.enabled_rules:
+                    t.status = "skipped"
+                    t.reason = "llm_rule_unselected"
+                    task_status[t.node_id] = "skipped"
+                    updated_tasks.append(t)
+                    continue
+                idx = len(updated_tasks)
+                updated_tasks.append(t)
+                pending_ai_indices.append((idx, t))
+                continue
+
             if rule.executor_type == "fact_validator":
                 if rule.id == "STAT-PRANGE":
                     f_list, chk, exc = _validate_p_range(facts, knowledge)
@@ -364,6 +390,41 @@ def execute_plan(
             task_status[t.node_id] = "failed"
 
         updated_tasks.append(t)
+
+    # 并发执行就绪的 AI 语义审校任务，显著缩短端到端等待时间
+    if pending_ai_indices:
+        def _run_one(task_obj: ReviewTask) -> tuple[list[Finding], int, int]:
+            r = registry.get(task_obj.rule_id)
+            c = knowledge.get_clause(r.basis_id)
+            return run_semantic_rule_with_llm(
+                r,
+                document,
+                journal,
+                resolved_llm,
+                c.source if c else "",
+                client_factory=llm_client_factory,
+            )
+
+        with ThreadPoolExecutor(max_workers=min(4, len(pending_ai_indices))) as pool:
+            futures = [(idx, t, pool.submit(_run_one, t)) for idx, t in pending_ai_indices]
+            for idx, t, fut in futures:
+                try:
+                    f_list, chk, exc = fut.result()
+                    raw_findings.extend(f_list)
+                    t.checked_count = chk
+                    t.excluded_count = exc
+                    t.finding_count = len(f_list)
+                    t.status = "findings" if f_list else "passed"
+                    t.reason = (
+                        f"ai_findings:{len(f_list)} ({resolved_llm.provider}/{resolved_llm.model})"
+                        if f_list
+                        else f"ai_checked_ok ({resolved_llm.provider}/{resolved_llm.model})"
+                    )
+                except Exception as exc:
+                    has_failure = True
+                    t.status = "failed"
+                    t.reason = f"error:{exc}"
+                updated_tasks[idx] = t
 
     final_plan = plan.model_copy(update={"tasks": updated_tasks})
     return final_plan, facts, raw_findings, has_failure

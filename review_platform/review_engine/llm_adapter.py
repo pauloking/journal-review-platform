@@ -1,23 +1,117 @@
-"""可插拔大模型审校候选适配器（移植自 medical-journal-reviewer/src/services/aiService.ts）。
+"""可插拔大模型审校候选适配器（移植并升级自 medical-journal-reviewer/src/services/aiService.ts）。
 
-包含经过实战验证的三项核心防线：
-1. 括号配平 JSON 提取 + 截断安全修复（extract_json_block / repair_json / parse_model_json）
-2. 运行时动态时间基准（防止训练截止早于当前年份导致把 2026 等当期年份误判为“未来时间”）
-3. AI 候选隔离协议：大模型仅能输出 ai_candidate，必须通过 FindingEngine 锚点与规范依据门禁。
+包含经过实战验证的核心防线：
+1. 支持 OpenAI / Claude / 自定义 OpenAI 兼容接口（如 DeepSeek、GLM、Qwen、Ollama、vLLM 等）
+2. 括号配平 JSON 提取 + 截断安全修复（extract_json_block / repair_json / parse_model_json）
+3. 运行时动态时间基准（防止把 2026 等当期年份误判为“未来时间”）
+4. 推理思考关闭开关（disable_thinking -> enable_thinking=False，防止超长推理截断）
+5. 原文逐字锚点定位与 AI 候选隔离协议（绝不自动改写科研数据，定位失败进入拦截清单）
 """
 
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
+import os
 import re
-from typing import Any, Protocol
+import time
+from typing import Any, Callable, Optional, Protocol
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from review_platform.models import DocumentIR, Finding, JournalProfile
+import httpx
+
+from review_platform.models import (
+    Anchor,
+    AnchorVerification,
+    DocumentIR,
+    Finding,
+    JournalProfile,
+    LLMConfig,
+    LLMTestResult,
+    RuleSpec,
+)
 
 FUTURE_MISJUDGE_RE = re.compile(r"未来|尚未发生|还未发生|没有发生|不存在于|无法核实|疑似虚构|不可信")
 TIME_REFERENCE_RE = re.compile(r"日期|时间|年份|时点|20\d{2}\s*年")
+
+DEFAULT_ENDPOINTS = {
+    "openai": "https://api.openai.com/v1/chat/completions",
+    "claude": "https://api.anthropic.com/v1/messages",
+    "custom": "",
+}
+DEFAULT_MODELS = {
+    "openai": "gpt-4o-mini",
+    "claude": "claude-3-5-sonnet-20241022",
+    "custom": "gpt-4o",
+}
+
+RULE_INSTRUCTIONS: dict[str, str] = {
+    "AI-ABSTRACT-CONSISTENCY": (
+        "请专项核查【摘要与正文一致性】：\n"
+        "1. 摘要是否具备「目的、方法、结果、结论」四要素；\n"
+        "2. 摘要中报告的样本量、分组数、主要结局指标、P 值与置信区间是否与正文方法/结果/表格数据一致；\n"
+        "3. 摘要结论是否有正文数据支撑。"
+    ),
+    "AI-METHOD-DESIGN": (
+        "请专项核查【研究设计与统计学方法】:\n"
+        "1. 研究设计类型（RCT/队列/病例对照/横断面/Meta分析）与研究目的是否匹配；\n"
+        "2. 纳入/排除标准、随机化与盲法、样本量估算依据是否完整；\n"
+        "3. 统计学检验方法（t检验、χ²、ANOVA、非参数检验、多因素回归）与数据类型是否适配，是否遗漏伦理批件号与知情同意声明。"
+    ),
+    "AI-DATA-LOGIC": (
+        "请专项核查【图文表对应与论证逻辑】：\n"
+        "1. 正文对图表结果的解读是否与表格实际数据吻合；\n"
+        "2. 讨论与结论是否存在超出本研究设计（如横断面推断因果）的过度推断；\n"
+        "3. 是否充分客观讨论研究局限性与偏倚风险。"
+    ),
+    "AI-LANGUAGE-STYLE": (
+        "请专项核查【学术语言与表达逻辑】：\n"
+        "1. 识别长难句句式杂糅、主谓搭配不当、成分残缺、指代不明；\n"
+        "2. 识别前后段落逻辑衔接断层或非学术口语化表达；\n"
+        "3. 仅提出语言表达修改建议，严禁改动任何科研数据与统计结果。"
+    ),
+}
+
+
+def get_llm_env_defaults_public() -> dict[str, Any]:
+    """返回脱敏后的环境变量默认 LLM 配置状态（绝不返回 api_key）。"""
+    env_key = os.environ.get("REVIEW_LLM_API_KEY", "").strip()
+    env_provider = os.environ.get("REVIEW_LLM_PROVIDER", "openai").strip()
+    if env_provider not in ("openai", "claude", "custom"):
+        env_provider = "openai"
+    return {
+        "has_env_default": bool(env_key or os.environ.get("REVIEW_LLM_ENDPOINT", "").strip()),
+        "provider": env_provider,
+        "endpoint": os.environ.get("REVIEW_LLM_ENDPOINT", "").strip(),
+        "model": os.environ.get("REVIEW_LLM_MODEL", "").strip(),
+    }
+
+
+def resolve_llm_config(user_cfg: Optional[LLMConfig]) -> LLMConfig:
+    """合并用户提交配置与可选服务端环境变量默认配置。"""
+    if user_cfg is None:
+        env_enabled = os.environ.get("REVIEW_LLM_ENABLED", "").strip().lower() in ("1", "true", "yes")
+        if not env_enabled:
+            return LLMConfig(enabled=False)
+        user_cfg = LLMConfig(enabled=True)
+
+    if not user_cfg.enabled:
+        return user_cfg
+
+    provider = user_cfg.provider
+    endpoint = user_cfg.endpoint.strip() or os.environ.get("REVIEW_LLM_ENDPOINT", "").strip()
+    model = user_cfg.model.strip() or os.environ.get("REVIEW_LLM_MODEL", "").strip() or DEFAULT_MODELS[provider]
+    api_key = user_cfg.api_key.strip() or os.environ.get("REVIEW_LLM_API_KEY", "").strip()
+
+    return user_cfg.model_copy(
+        update={
+            "endpoint": endpoint,
+            "model": model,
+            "api_key": api_key,
+        }
+    )
 
 
 def build_time_anchored_system_prompt(now: datetime.datetime | None = None) -> str:
@@ -203,8 +297,302 @@ def parse_model_json(response: str) -> dict[str, Any]:
     raise ValueError("模型返回的 JSON 无法解析与修复")
 
 
+def _resolve_endpoint(config: LLMConfig) -> str:
+    raw = config.endpoint.strip()
+    if config.provider == "openai":
+        ep = raw or DEFAULT_ENDPOINTS["openai"]
+    elif config.provider == "claude":
+        ep = raw or DEFAULT_ENDPOINTS["claude"]
+    else:
+        if not raw:
+            raise ValueError("自定义接口必须提供 Base URL / Endpoint")
+        ep = raw.rstrip("/")
+        if not (ep.endswith("/v1/chat/completions") or ep.endswith("/chat/completions")):
+            ep = f"{ep}/chat/completions" if ep.endswith("/v1") else f"{ep}/v1/chat/completions"
+
+    parsed = urlparse(ep)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("接口地址必须为合法的 http:// 或 https:// URL")
+    return ep
+
+
+def _is_local_endpoint(endpoint: str) -> bool:
+    host = (urlparse(endpoint).hostname or "").lower()
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def call_llm_completion(
+    config: LLMConfig,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    max_tokens_override: Optional[int] = None,
+    client_factory: Optional[Callable[[float], httpx.Client]] = None,
+) -> str:
+    """调用用户配置的大模型（OpenAI / Claude / 自定义兼容接口）。"""
+    endpoint = _resolve_endpoint(config)
+    model = config.model.strip() or DEFAULT_MODELS[config.provider]
+    api_key = config.api_key.strip()
+
+    if not api_key and not (config.provider == "custom" and _is_local_endpoint(endpoint)):
+        raise ValueError("请提供有效的 API Key")
+
+    max_tokens = max_tokens_override or config.max_tokens
+    make_client = client_factory or (lambda t: httpx.Client(timeout=t))
+
+    with make_client(config.timeout_seconds) as client:
+        if config.provider == "claude":
+            headers = {
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            }
+            payload: dict[str, Any] = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_prompt}],
+            }
+            resp = client.post(endpoint, headers=headers, json=payload)
+        else:
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": config.temperature,
+                "max_tokens": max_tokens,
+                "stream": False,
+            }
+            if config.disable_thinking:
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
+            resp = client.post(endpoint, headers=headers, json=payload)
+
+    if resp.status_code >= 400:
+        detail = ""
+        try:
+            err_json = resp.json()
+            detail = err_json.get("error", {}).get("message") or err_json.get("message") or ""
+        except Exception:
+            detail = resp.text[:180]
+        raise RuntimeError(f"大模型接口错误 ({resp.status_code}): {detail or resp.reason_phrase}")
+
+    data = resp.json()
+    if config.provider == "claude":
+        blocks = data.get("content") or []
+        text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+    else:
+        choices = data.get("choices") or []
+        msg = choices[0].get("message", {}) if choices else {}
+        text = msg.get("content") or (choices[0].get("text") if choices else "") or ""
+
+    if not isinstance(text, str) or not text.strip():
+        raise RuntimeError("大模型返回内容为空（若使用推理模型，建议开启「关闭思考链」或增大 max_tokens）")
+    return text
+
+
+def test_llm_connection(
+    config: LLMConfig,
+    *,
+    client_factory: Optional[Callable[[float], httpx.Client]] = None,
+) -> LLMTestResult:
+    """验证模型接口连通性（绝不在返回值中回显 API Key）。"""
+    resolved = resolve_llm_config(config.model_copy(update={"enabled": True}))
+    t0 = time.perf_counter()
+    try:
+        reply = call_llm_completion(
+            resolved,
+            "你是连接测试助手，请简短回复。",
+            "请回复：连接成功",
+            max_tokens_override=64,
+            client_factory=client_factory,
+        )
+        dt = round((time.perf_counter() - t0) * 1000, 1)
+        return LLMTestResult(
+            ok=True,
+            provider=resolved.provider,
+            model=resolved.model,
+            latency_ms=dt,
+            preview=reply.strip()[:80],
+            message="模型连接测试成功",
+        )
+    except Exception as exc:
+        dt = round((time.perf_counter() - t0) * 1000, 1)
+        return LLMTestResult(
+            ok=False,
+            provider=resolved.provider,
+            model=resolved.model,
+            latency_ms=dt,
+            message=str(exc),
+        )
+
+
+def _locate_quote_anchor(
+    document: DocumentIR,
+    block_hint: str,
+    quote: str,
+) -> Anchor:
+    """在 DocumentIR 中逐字定位 AI 返回的 originalText；找不到则返回未命中锚点供门禁拦截。"""
+    clean_q = quote.strip()
+    if clean_q and len(clean_q) >= 2:
+        blocks = list(document.blocks)
+        if block_hint:
+            hinted = [b for b in blocks if b.id == block_hint]
+            blocks = hinted + [b for b in blocks if b.id != block_hint]
+        for blk in blocks:
+            idx = blk.text.find(clean_q)
+            if idx >= 0:
+                return Anchor(
+                    document_id=document.document_id,
+                    block_id=blk.id,
+                    start=idx,
+                    end=idx + len(clean_q),
+                    quote=clean_q,
+                )
+        # 去除模型外层可能自加的引号后再次精确匹配（不压缩内部空白）
+        stripped = clean_q.strip("“”‘’\"'「」")
+        if len(stripped) >= 2 and stripped != clean_q:
+            for blk in blocks:
+                idx = blk.text.find(stripped)
+                if idx >= 0:
+                    return Anchor(
+                        document_id=document.document_id,
+                        block_id=blk.id,
+                        start=idx,
+                        end=idx + len(stripped),
+                        quote=stripped,
+                    )
+
+    fallback_block = document.blocks[0].id if document.blocks else "P0001"
+    return Anchor(
+        document_id=document.document_id,
+        block_id=block_hint or fallback_block,
+        start=0,
+        end=0,
+        quote=clean_q or "(未提供原文引文)",
+    )
+
+
+def run_semantic_rule_with_llm(
+    rule: RuleSpec,
+    document: DocumentIR,
+    journal: JournalProfile,
+    config: LLMConfig,
+    basis_source: str,
+    *,
+    client_factory: Optional[Callable[[float], httpx.Client]] = None,
+) -> tuple[list[Finding], int, int]:
+    """执行单条受控 AI 语义规则，返回待 FindingEngine 门禁核验的候选意见。"""
+    applies_to = set(rule.applies_to) if rule.applies_to else None
+    target_blocks = [
+        b
+        for b in document.blocks
+        if b.kind != "separator" and (not applies_to or b.section in applies_to)
+    ]
+    if not target_blocks:
+        return [], 0, 0
+
+    manuscript_lines = [f"[{b.id} | {b.section_cn}] {b.text}" for b in target_blocks]
+    manuscript_text = "\n".join(manuscript_lines)
+    # 防止超长稿件撑爆单次上下文，保守截断到约 24000 字符并明确提示
+    if len(manuscript_text) > 24000:
+        manuscript_text = manuscript_text[:24000] + "\n…（后续内容超出单次模型上下文预算已截断）"
+
+    dimension_guide = RULE_INSTRUCTIONS.get(rule.id, rule.message_template)
+    user_prompt = (
+        f"目标期刊：{journal.name}（{journal.id}）\n"
+        f"当前审校维度：{rule.title}（规则编号：{rule.id}）\n"
+        f"{dimension_guide}\n\n"
+        "## 严格输出要求\n"
+        "1. 严格输出如下 JSON 格式，不要输出任何额外解释：\n"
+        "{\n"
+        '  "findings": [\n'
+        "    {\n"
+        '      "blockId": "段落编号，如 P0002",\n'
+        '      "originalText": "必须从下方文本块中逐字连续复制的有问题原文片段（不要包含[P0002|...]前缀，不要改写）",\n'
+        '      "description": "具体问题描述",\n'
+        '      "suggestion": "修改建议（严禁擅自捏造或篡改科研数据）",\n'
+        '      "reason": "审校理由",\n'
+        '      "severity": "warning"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        '2. 若未发现该维度下的明确问题，返回 {"findings": []}，宁缺毋滥。\n'
+        "3. severity 仅允许 error / warning / info。\n\n"
+        f"## 稿件文本块\n{manuscript_text}"
+    )
+
+    raw_reply = call_llm_completion(
+        config,
+        build_time_anchored_system_prompt(),
+        user_prompt,
+        client_factory=client_factory,
+    )
+    parsed = parse_model_json(raw_reply)
+    raw_items = parsed.get("findings") or parsed.get("annotations") or []
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    findings: list[Finding] = []
+    excluded = 0
+
+    for idx, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            continue
+        if is_future_date_misjudgment(item):
+            excluded += 1
+            continue
+        desc = str(item.get("description") or item.get("message") or "").strip()
+        sugg = str(item.get("suggestion") or "").strip()
+        if not desc and not sugg:
+            continue
+
+        orig_text = str(item.get("originalText") or item.get("quote") or "").strip()
+        block_hint = str(item.get("blockId") or item.get("block_id") or "").strip()
+        anchor = _locate_quote_anchor(document, block_hint, orig_text)
+
+        sev = str(item.get("severity") or rule.severity).lower()
+        if sev not in ("error", "warning", "info"):
+            sev = rule.severity
+
+        raw_id = f"{rule.id}:{anchor.block_id}:{anchor.start}:{anchor.end}:{anchor.quote}:{idx}".encode("utf-8")
+        fid = f"ai-{hashlib.sha256(raw_id).hexdigest()[:12]}"
+
+        findings.append(
+            Finding(
+                id=fid,
+                rule_id=rule.id,
+                rule_version=rule.version,
+                basis_id=rule.basis_id,
+                basis_source=basis_source,
+                title=rule.title,
+                category=rule.category,
+                scope=rule.scope,
+                severity=sev,  # type: ignore[arg-type]
+                anchor=anchor,
+                fact_ids=[],
+                message=desc or rule.message_template,
+                suggestion=sugg or rule.suggestion_template,
+                evidence={
+                    "provider": config.provider,
+                    "model": config.model,
+                    "reason": str(item.get("reason") or "").strip(),
+                    "block_hint": block_hint,
+                },
+                source_type="ai_candidate",
+                verification=AnchorVerification(anchor_valid=False, basis_valid=False, reason="pending"),
+            )
+        )
+
+    return findings, len(target_blocks), excluded
+
+
 class AICandidateExecutor(Protocol):
-    """V0.4+ 可插拔大模型语义审校执行器接口（仅返回候选 Finding，须过门禁）。"""
+    """可插拔大模型语义审校执行器接口（仅返回候选 Finding，须过门禁）。"""
 
     def generate_candidates(
         self, document: DocumentIR, journal: JournalProfile

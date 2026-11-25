@@ -321,6 +321,35 @@ class DecisionRequest(BaseModel):
     expected_revision: int = Field(ge=0)
 
 
+LLMProviderType = Literal["openai", "claude", "custom"]
+
+
+class LLMConfig(BaseModel):
+    """用户自定义大模型配置（api_key 仅用于当次请求，绝不写入数据库或导出文件）。"""
+
+    enabled: bool = False
+    provider: LLMProviderType = "openai"
+    endpoint: str = ""
+    api_key: str = ""
+    model: str = ""
+    temperature: float = Field(default=0.2, ge=0.0, le=1.5)
+    max_tokens: int = Field(default=4096, ge=256, le=32768)
+    disable_thinking: bool = True
+    timeout_seconds: float = Field(default=60.0, ge=5.0, le=300.0)
+    enabled_rules: list[str] = Field(default_factory=list)
+
+
+class LLMTestResult(BaseModel):
+    """大模型连接测试结果。"""
+
+    ok: bool
+    provider: LLMProviderType
+    model: str
+    latency_ms: float
+    preview: str = ""
+    message: str = ""
+
+
 class ReviewRun(BaseModel):
     """单次审校运行的完整可追溯快照。"""
 

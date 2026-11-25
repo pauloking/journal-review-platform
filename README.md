@@ -4,7 +4,7 @@
 
 本仓库严格按能力平台架构建设，优先审计并复用了本机已有两项成熟医学审校资产（详见 [现有项目核查](docs/EXISTING_PROJECT_AUDIT.md)）：
 - `medical-journal-copyediting-2.0.0`：章节结构识别（`legacy_structure.py`）、四层规范规则库（`knowledge_packs/medical_cn_v1/rules/*.json`）与上下文/年份豁免逻辑；
-- `medical-journal-reviewer`：原生 OOXML Word 批注安全防踩坑经验、综合审评报告 DOCX 导出、大模型 JSON 括号配平修复与动态时间基准、以及问题大类归并统计口径。
+- `medical-journal-reviewer`：原生 OOXML Word 批注安全防踩坑经验、综合审评报告 DOCX 导出、OpenAI/Claude/自定义大模型接入与 JSON 括号配平修复、动态时间基准、以及问题大类归并统计口径。
 
 ## 快速开始
 
@@ -25,6 +25,13 @@ python -m uvicorn review_platform.api:create_app --factory --host 127.0.0.1 --po
 
 # 可选：部署鉴权（通过环境变量启用 Bearer Token + RBAC）
 # export REVIEW_API_TOKENS='{"tok-editor":{"user":"王编辑","role":"editor"},"tok-admin":{"user":"规则管理员","role":"admin"}}'
+
+# 可选：服务端默认大模型配置（也可直接在网页工作台自定义配置，API Key 不落库）
+# export REVIEW_LLM_ENABLED=1
+# export REVIEW_LLM_PROVIDER=custom
+# export REVIEW_LLM_ENDPOINT=https://api.deepseek.com/v1
+# export REVIEW_LLM_MODEL=deepseek-chat
+# export REVIEW_LLM_API_KEY=sk-...
 ```
 
 打开浏览器访问 `http://127.0.0.1:8000/` 即可体验完整纵向闭环（上传 DOCX → Document IR → Router DAG → 带原文高亮与依据的意见 → 编辑裁决 → 导出原生 Word 批注与综合报告）。

@@ -6,9 +6,13 @@ from .llm_adapter import (
     AICandidateExecutor,
     build_time_anchored_system_prompt,
     extract_json_block,
+    get_llm_env_defaults_public,
     is_future_date_misjudgment,
     parse_model_json,
     repair_json,
+    resolve_llm_config,
+    run_semantic_rule_with_llm,
+    test_llm_connection,
 )
 
 __all__ = [
@@ -17,7 +21,11 @@ __all__ = [
     "execute_plan",
     "extract_facts",
     "extract_json_block",
+    "get_llm_env_defaults_public",
     "is_future_date_misjudgment",
     "parse_model_json",
     "repair_json",
+    "resolve_llm_config",
+    "run_semantic_rule_with_llm",
+    "test_llm_connection",
 ]

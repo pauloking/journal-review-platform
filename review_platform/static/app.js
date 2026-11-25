@@ -112,9 +112,15 @@ async function init() {
   });
 
   await refreshRegistry();
+  await initLlmConfigPanel();
 
   document.getElementById('run-btn').addEventListener('click', runReview);
   document.getElementById('load-run-btn').addEventListener('click', refreshCurrentRun);
+  document.getElementById('llm-save-btn').addEventListener('click', saveLlmConfigLocal);
+  document.getElementById('llm-test-btn').addEventListener('click', testLlmConnectionUi);
+  document.getElementById('llm-enabled').addEventListener('change', updateLlmStatusPill);
+  document.getElementById('llm-provider').addEventListener('change', updateLlmStatusPill);
+  document.getElementById('llm-model').addEventListener('input', updateLlmStatusPill);
   document.getElementById('filter-decision').addEventListener('change', renderFindings);
   document.getElementById('export-json-btn').addEventListener('click', () => downloadExport('json'));
   document.getElementById('export-md-btn').addEventListener('click', () => downloadExport('markdown'));
@@ -171,6 +177,101 @@ function renderRunningPlaceholder() {
     '<div class="step-node running"><div class="step-title">正在后台执行全量审校流水线…</div><div class="step-summary">等待服务端返回 Document IR、Router DAG 与真实执行追踪（非示意进度）</div></div>';
 }
 
+const LLM_STORAGE_KEY = 'jrp_llm_config_v1';
+let llmAiRules = [];
+
+async function initLlmConfigPanel() {
+  try {
+    const res = await fetch('/llm/defaults');
+    const defs = res.ok ? await res.json() : { ai_rules: [] };
+    llmAiRules = defs.ai_rules || [];
+
+    let saved = {};
+    try {
+      saved = JSON.parse(localStorage.getItem(LLM_STORAGE_KEY) || '{}');
+    } catch {
+      saved = {};
+    }
+
+    document.getElementById('llm-enabled').checked = Boolean(saved.enabled);
+    document.getElementById('llm-disable-thinking').checked = saved.disable_thinking !== false;
+    document.getElementById('llm-provider').value = saved.provider || defs.provider || 'openai';
+    document.getElementById('llm-model').value = saved.model || defs.model || '';
+    document.getElementById('llm-endpoint').value = saved.endpoint || defs.endpoint || '';
+    document.getElementById('llm-api-key').value = saved.api_key || '';
+
+    const selectedSet = new Set(Array.isArray(saved.enabled_rules) && saved.enabled_rules.length ? saved.enabled_rules : llmAiRules.map((r) => r.id));
+    document.getElementById('llm-dims-list').innerHTML = llmAiRules
+      .map(
+        (r) => `<label class="chk-label"><input type="checkbox" class="llm-dim-chk" value="${esc(r.id)}" ${selectedSet.has(r.id) ? 'checked' : ''} /> ${esc(r.title.replace(/^\[AI 语义\]\s*/, ''))}</label>`
+      )
+      .join('');
+
+    updateLlmStatusPill();
+  } catch {
+    // 非阻断
+  }
+}
+
+function collectLlmConfig() {
+  const checkedDims = Array.from(document.querySelectorAll('.llm-dim-chk'))
+    .filter((el) => el.checked)
+    .map((el) => el.value);
+  return {
+    enabled: Boolean(document.getElementById('llm-enabled')?.checked),
+    provider: document.getElementById('llm-provider')?.value || 'openai',
+    endpoint: (document.getElementById('llm-endpoint')?.value || '').trim(),
+    api_key: (document.getElementById('llm-api-key')?.value || '').trim(),
+    model: (document.getElementById('llm-model')?.value || '').trim(),
+    disable_thinking: Boolean(document.getElementById('llm-disable-thinking')?.checked),
+    enabled_rules: checkedDims,
+  };
+}
+
+function updateLlmStatusPill() {
+  const cfg = collectLlmConfig();
+  const pill = document.getElementById('llm-status-pill');
+  if (!pill) return;
+  if (cfg.enabled) {
+    pill.className = 'pill-ai';
+    pill.textContent = `已启用 · ${cfg.provider}${cfg.model ? ' / ' + cfg.model : ''}`;
+  } else {
+    pill.className = 'pill-skip';
+    pill.textContent = '未启用（仅确定性规则）';
+  }
+}
+
+function saveLlmConfigLocal() {
+  const cfg = collectLlmConfig();
+  localStorage.setItem(LLM_STORAGE_KEY, JSON.stringify(cfg));
+  updateLlmStatusPill();
+  const resEl = document.getElementById('llm-test-result');
+  resEl.textContent = '已保存至当前浏览器本地存储（API Key 不上传落库）。';
+}
+
+async function testLlmConnectionUi() {
+  const cfg = collectLlmConfig();
+  const resEl = document.getElementById('llm-test-result');
+  resEl.textContent = '正在测试模型连接...';
+  try {
+    const res = await fetch('/llm/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...cfg, enabled: true }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      resEl.textContent = `测试失败：${data.detail || res.status}`;
+      return;
+    }
+    resEl.textContent = data.ok
+      ? `连接成功（${data.model}，耗时 ${data.latency_ms}ms）：${data.preview}`
+      : `连接失败：${data.message}`;
+  } catch (err) {
+    resEl.textContent = `请求异常：${err.message || err}`;
+  }
+}
+
 async function runReview() {
   const input = document.getElementById('docx-input');
   const file = input.files?.[0];
@@ -182,8 +283,13 @@ async function runReview() {
   const journal = document.getElementById('journal-select').value;
   const fd = new FormData();
   fd.append('file', file);
+  const llmCfg = collectLlmConfig();
+  localStorage.setItem(LLM_STORAGE_KEY, JSON.stringify(llmCfg));
+  if (llmCfg.enabled) {
+    fd.append('llm_config', JSON.stringify(llmCfg));
+  }
 
-  showBanner('正在执行审校流水线...');
+  showBanner(llmCfg.enabled ? '正在执行确定性规则 + AI 受控语义审校流水线...' : '正在执行审校流水线...');
   renderRunningPlaceholder();
 
   try {
@@ -392,9 +498,14 @@ function renderFindings() {
   const actionLabels = { accept: '已采纳', reject: '已驳回', defer: '暂缓' };
 
   const excludedFacts = (currentRun.facts || []).filter((f) => f.status === 'excluded');
-  const excludedNotice = excludedFacts.length
-    ? `<div class="banner" style="margin-bottom:10px;">提示：共有 ${excludedFacts.length} 处数值/题注事实因处于示例引文语境被豁免，请在上方「事实台账 (FactLedger)」标签中人工复核。</div>`
-    : '';
+  const rejectedCands = currentRun.rejected_candidates || [];
+  let excludedNotice = '';
+  if (excludedFacts.length) {
+    excludedNotice += `<div class="banner" style="margin-bottom:8px;">提示：共有 ${excludedFacts.length} 处数值/题注事实因处于示例引文语境被豁免，请在上方「事实台账 (FactLedger)」标签中人工复核。</div>`;
+  }
+  if (rejectedCands.length) {
+    excludedNotice += `<div class="banner error" style="margin-bottom:8px;">门禁拦截：已拦截 ${rejectedCands.length} 条未通过原文逐字定位或依据存在性校验的 AI 候选输出（不纳入正式意见）。</div>`;
+  }
 
   const items = currentRun.findings.filter((f) => {
     const dec = latest[f.id];
@@ -413,9 +524,13 @@ function renderFindings() {
       const rev = dec ? dec.revision : 0;
       const decText = dec ? `${actionLabels[dec.action]} (v${dec.revision})` : '待裁决';
       const decCls = dec ? `dec-${dec.action}` : '';
+      const aiTag =
+        f.source_type === 'ai_candidate'
+          ? ` <span class="pill-ai">AI 候选 · ${esc(f.evidence?.model || f.evidence?.provider || 'LLM')}</span>`
+          : '';
       return `<div class="finding-card">
         <div class="finding-head">
-          <span class="sev-${esc(f.severity)}">[${esc(f.severity.toUpperCase())}] ${esc(f.rule_id)} · ${esc(f.title)}</span>
+          <span class="sev-${esc(f.severity)}">[${esc(f.severity.toUpperCase())}] ${esc(f.rule_id)} · ${esc(f.title)}${aiTag}</span>
           <span class="dec-pill ${decCls}">${esc(decText)}</span>
         </div>
         <div class="hint">定位：<code>${esc(f.anchor.block_id)}</code> [${f.anchor.start}:${f.anchor.end}] · 原文「<b>${esc(f.anchor.quote)}</b>」</div>

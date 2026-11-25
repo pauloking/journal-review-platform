@@ -13,12 +13,13 @@ def test_builtin_knowledge_documents_and_markdown_export(tmp_path: Path):
     res = client.get("/knowledge/documents")
     assert res.status_code == 200
     docs = res.json()["documents"]
-    assert len(docs) == 9
+    assert len(docs) == 10
 
     ids = {d["doc_id"] for d in docs}
     assert "DOC-GBT15835-2011" in ids
     assert "DOC-CNTERM-MEDICAL" in ids
     assert "DOC-MATH-STRUCTURE" in ids
+    assert "DOC-AI-SEMANTIC" in ids
 
     num_doc = client.get("/knowledge/documents/DOC-GBT15835-2011").json()
     assert "NUM-RANGE" in num_doc["rule_ids"]

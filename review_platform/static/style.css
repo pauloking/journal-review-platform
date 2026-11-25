@@ -350,3 +350,17 @@ th { background: #f8fafc; color: var(--muted); }
 .pill-hit { background: #fee2e2; color: var(--danger); padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
 .pill-ok { background: #dcfce7; color: var(--ok); padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
 .pill-skip { background: #f1f5f9; color: var(--muted); padding: 1px 7px; border-radius: 999px; font-size: 11px; }
+.pill-ai { background: #ede9fe; color: #5b21b6; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+.llm-summary {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.llm-body { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+.llm-toggle-row { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 10px; font-size: 13px; }
+.chk-label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; }
+.llm-dims-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 4px; }
+.llm-dims-list { display: flex; flex-wrap: wrap; gap: 12px; }

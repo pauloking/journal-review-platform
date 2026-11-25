@@ -7,7 +7,9 @@ import hashlib
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+
+import httpx
 
 from review_platform import PLATFORM_VERSION
 from review_platform.document_engine import parse_docx_bytes
@@ -18,10 +20,11 @@ from review_platform.models import (
     ExecutionTraceStep,
     KnowledgeClause,
     KnowledgeDocument,
+    LLMConfig,
     ReviewRun,
     RuleSpec,
 )
-from review_platform.review_engine import execute_plan
+from review_platform.review_engine import execute_plan, resolve_llm_config
 from review_platform.router import build_execution_plan
 from review_platform.rule_registry import (
     RuleRegistry,
@@ -218,8 +221,11 @@ class PlatformContext:
         filename: str = "manuscript.docx",
         journal_id: str = "general-medical-cn",
         fail_nodes: Optional[set[str]] = None,
+        llm_config: Optional[LLMConfig] = None,
+        llm_client_factory: Optional[Callable[[float], httpx.Client]] = None,
     ) -> ReviewRun:
         trace: list[ExecutionTraceStep] = []
+        resolved_llm = resolve_llm_config(llm_config)
 
         t0 = time.perf_counter()
         doc_ir = parse_docx_bytes(raw_docx, filename=filename)
@@ -289,6 +295,8 @@ class PlatformContext:
             self.registry,
             self.knowledge,
             fail_nodes=fail_nodes,
+            llm_config=resolved_llm,
+            llm_client_factory=llm_client_factory,
         )
         dt_exec = round((time.perf_counter() - t3) * 1000, 2)
 
@@ -365,7 +373,9 @@ class PlatformContext:
             )
         )
 
-        run_seed = f"{doc_ir.document_id}:{journal.id}:{journal.version}:{final_plan.rule_snapshot_hash}:{PLATFORM_VERSION}"
+        # 确定性 run_id：同文档、同期刊版本、同规则快照、同模型配置开关产生确定性 ID（绝不含 api_key）
+        llm_tag = f"{resolved_llm.provider}:{resolved_llm.model}" if resolved_llm.enabled else "off"
+        run_seed = f"{doc_ir.document_id}:{journal.id}:{journal.version}:{final_plan.rule_snapshot_hash}:{llm_tag}:{PLATFORM_VERSION}"
         run_id = f"run-{hashlib.sha256(run_seed.encode('utf-8')).hexdigest()[:14]}"
 
         if has_failure or doc_ir.profile.structure_status != "reliable" or len(rejected) > 0:
