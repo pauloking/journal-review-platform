@@ -98,12 +98,26 @@
       </div>
     </section>
 
-    <!-- Tab 2: Registry & Knowledge -->
+    <!-- Tab 2: Document-Centric Knowledge & Rule Library -->
     <section id="tab-registry" class="tab-panel">
-      <div class="card">
-        <h2>版本化规则注册表 & 结构化规范依据</h2>
-        <p class="hint">所有规则逻辑与依据条款均由后端 Knowledge Engine / Rule Registry 统一注册，严禁硬编码于前端或大模型 Prompt 中。</p>
-        <div id="registry-content"></div>
+      <div class="doc-library-layout">
+        <!-- Left Sidebar: Document List -->
+        <aside class="card doc-sidebar">
+          <div class="sidebar-top">
+            <h2>规范文档库</h2>
+            <button id="new-doc-btn" class="btn small primary">+ 新建文档</button>
+          </div>
+          <input id="doc-search-input" class="doc-search" type="search" placeholder="搜索规范文档或标准..." />
+          <div id="doc-list" class="doc-list"></div>
+        </aside>
+
+        <!-- Right Pane: Document Viewer / Editor -->
+        <div class="card doc-reader-pane">
+          <div id="doc-viewer" class="doc-viewer">
+            <p class="hint">请从左侧选择一份规范文档查看或维护。</p>
+          </div>
+          <div id="doc-editor" class="doc-editor hidden"></div>
+        </div>
       </div>
     </section>
 

@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS evaluation_feedback (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS knowledge_documents (
+    doc_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_decisions_run ON editorial_decisions(run_id, finding_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_rule ON evaluation_feedback(rule_id);
 """
@@ -240,3 +246,24 @@ class ReviewStore:
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def save_knowledge_document(self, doc_id: str, payload_json: str, updated_at: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO knowledge_documents (doc_id, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(doc_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (doc_id, payload_json, updated_at),
+            )
+            conn.commit()
+
+    def list_knowledge_documents(self) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM knowledge_documents ORDER BY updated_at ASC"
+            ).fetchall()
+        return [str(r["payload_json"]) for r in rows]

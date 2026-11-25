@@ -96,6 +96,68 @@ class KnowledgeClause(BaseModel):
     license_note: str = "结构化规范元数据摘要"
 
 
+class MaintainableTermRule(BaseModel):
+    """面向编辑与规则维护人员的可读规则条目（自动绑定正反例校验）。"""
+
+    rule_id: str = Field(..., min_length=2, max_length=64)
+    nonstandard: str = ""
+    standard: str = ""
+    severity: SeverityType = "warning"
+    is_regex: bool = False
+    exception_after: list[str] = Field(default_factory=list)
+    applies_to: list[str] = Field(
+        default_factory=lambda: [
+            "title",
+            "abstract",
+            "keywords",
+            "introduction",
+            "methods",
+            "results",
+            "discussion",
+            "conclusion",
+            "body",
+            "table",
+        ]
+    )
+    example: str = ""
+    counter_example: str = ""
+    description: str = ""
+
+
+class KnowledgeDocument(BaseModel):
+    """用户端可阅读、可维护的规范文档（1 个文档对应 1 套规范依据及其可执行规则集）。"""
+
+    doc_id: str
+    basis_id: str
+    basis_ids: list[str] = Field(default_factory=list)
+    title: str
+    source: str
+    edition: str
+    scope: ScopeType
+    effective_date: str = ""
+    summary: str
+    body_markdown: str
+    rule_ids: list[str] = Field(default_factory=list)
+    maintainable_rules: list[MaintainableTermRule] = Field(default_factory=list)
+    is_builtin: bool = True
+    supports_rule_editing: bool = True
+    version: str = "1.0.0"
+    updated_at: str = ""
+
+
+class DocumentUpsertRequest(BaseModel):
+    """创建或更新规范文档的请求体（保存前必须通过正反例自动验证）。"""
+
+    doc_id: Optional[str] = None
+    title: str = Field(..., min_length=2, max_length=120)
+    source: str = Field(..., min_length=2, max_length=200)
+    edition: str = Field(default="2026", max_length=40)
+    scope: ScopeType = "journal"
+    summary: str = Field(..., min_length=2, max_length=500)
+    body_markdown: str = Field(..., min_length=5)
+    rules: list[MaintainableTermRule] = Field(default_factory=list)
+
+
 class JournalProfile(BaseModel):
     """期刊配置包：控制启用层级、禁用规则与数学容差。"""
 

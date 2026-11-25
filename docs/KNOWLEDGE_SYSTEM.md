@@ -35,3 +35,12 @@
 - `percentage_tolerance`: 百分比复算允许容差（默认 `0.5` 个百分点，实际取显示精度半单位与期刊容差的较大者）
 - `caption_start`: 图表起始编号（默认 `1`）
 - `custom_terms`: 期刊定制术语覆盖映射（不直接修改国家标准基础词库）
+
+## 5. 文档化规范库与可维护发布流（`KnowledgeDocument`）
+
+为保证规则库在用户端以**一份份可读、可维护的规范文档**呈现（而非扁平化代码清单），平台建立 `KnowledgeDocument` 模型与 `knowledge_packs/medical_cn_v1/documents/*.md` 文档包：
+
+- 每个规范依据（`basis_id`）绑定一份完整的 Markdown 规范文档，说明适用范围、编校要求、正反例对照及例外保护条件；
+- 支持通过工作台或 `POST /knowledge/documents`、`PUT /knowledge/documents/{doc_id}` 在线维护文档正文与可读规则条目，并支持导出 `.md` 文件；
+- **强验证发布门禁**：任何新增或修订的规则条目在保存激活前，系统必须自动执行正例命中检查（`example` 必命中）与反例防误报检查（`counter_example` 必不误报）；校验不通过返回 `422` 拒绝修改正式注册表；
+- 更新后原子递增文档版本并刷新 `rule_snapshot_hash`，已有的历史审校记录快照不受影响。

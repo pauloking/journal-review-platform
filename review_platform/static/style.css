@@ -174,3 +174,131 @@ mark.quote-hl { background: #fde047; padding: 0 2px; border-radius: 3px; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
 th { background: #f8fafc; color: var(--muted); }
+
+/* Document-centric Knowledge & Rule Library */
+.doc-library-layout {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 14px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .doc-library-layout { grid-template-columns: 1fr; }
+}
+.doc-sidebar {
+  max-height: 78vh;
+  overflow-y: auto;
+}
+.sidebar-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.sidebar-top h2 { margin: 0; font-size: 15px; }
+.doc-search {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.doc-group-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  margin: 10px 0 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.doc-nav-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+.doc-nav-item:hover { border-color: #93c5fd; background: #eff6ff; }
+.doc-nav-item.active {
+  background: #eff6ff;
+  border-color: var(--primary);
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+.doc-nav-title { font-size: 13px; font-weight: 600; color: var(--fg); margin-bottom: 3px; }
+.doc-nav-meta { font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; }
+.doc-reader-pane { min-height: 78vh; }
+.doc-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 12px;
+  margin-bottom: 14px;
+}
+.doc-header h2 { margin: 0 0 4px; font-size: 18px; }
+.scope-badge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #e0e7ff;
+  color: #3730a3;
+  font-weight: 600;
+}
+.md-body h1 { font-size: 18px; margin: 14px 0 8px; }
+.md-body h2 { font-size: 15px; margin: 16px 0 8px; border-bottom: 1px solid #eef2f6; padding-bottom: 4px; }
+.md-body h3 { font-size: 14px; margin: 12px 0 6px; }
+.md-body blockquote {
+  margin: 8px 0;
+  padding: 8px 12px;
+  background: #f8fafc;
+  border-left: 3px solid var(--primary);
+  color: #334155;
+  font-size: 13px;
+}
+.md-body ul, .md-body ol { padding-left: 20px; margin: 6px 0; }
+.md-body li { margin-bottom: 4px; font-size: 13px; }
+.md-body p { margin: 6px 0; font-size: 13px; }
+.md-body code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+.doc-rules-section { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+.doc-rules-section h3 { margin: 0 0 8px; font-size: 15px; }
+.ex-ok { color: var(--ok); font-size: 12px; }
+.ex-bad { color: var(--danger); font-size: 12px; }
+.editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+@media (max-width: 720px) { .editor-grid { grid-template-columns: 1fr; } }
+.editor-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.editor-field label { font-size: 12px; font-weight: 600; color: var(--muted); }
+.editor-field input, .editor-field select, .editor-field textarea {
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+}
+.rule-edit-row {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 8px;
+  background: #f8fafc;
+}
+.rule-edit-cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.rule-edit-cols input, .rule-edit-cols select {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 12px;
+  background: #fff;
+}

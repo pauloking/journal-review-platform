@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -24,7 +24,7 @@ from review_platform.editorial_engine import (
     export_markdown,
 )
 from review_platform.evaluation_engine import summarize_feedback_stats
-from review_platform.models import DecisionRequest, ReviewRun
+from review_platform.models import DecisionRequest, DocumentUpsertRequest, KnowledgeDocument, ReviewRun
 from review_platform.pipeline import PlatformContext
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -39,6 +39,10 @@ def create_app(db_path: Optional[str | Path] = None) -> FastAPI:
     )
     ctx = PlatformContext()
     store = ReviewStore(db_path or DEFAULT_DB_PATH)
+    persisted_docs = store.list_knowledge_documents()
+    if persisted_docs:
+        ctx.load_persisted_documents(persisted_docs)
+
     app.state.ctx = ctx
     app.state.store = store
 
@@ -57,8 +61,59 @@ def create_app(db_path: Optional[str | Path] = None) -> FastAPI:
             "rule_snapshot_hash": ctx.registry.snapshot_hash,
             "journals": [j.model_dump(mode="json") for j in ctx.knowledge.list_journals()],
             "clauses": [c.model_dump(mode="json") for c in ctx.knowledge.list_clauses()],
+            "documents": [d.model_dump(mode="json") for d in ctx.list_documents()],
             "rules": [r.model_dump(mode="json") for r in ctx.registry.list_rules()],
         }
+
+    @app.get("/knowledge/documents")
+    def list_knowledge_documents() -> dict:
+        return {
+            "rule_snapshot_hash": ctx.registry.snapshot_hash,
+            "documents": [d.model_dump(mode="json") for d in ctx.list_documents()],
+        }
+
+    @app.get("/knowledge/documents/{doc_id}", response_model=KnowledgeDocument)
+    def get_knowledge_document(doc_id: str) -> KnowledgeDocument:
+        try:
+            return ctx.get_document(doc_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/knowledge/documents/{doc_id}/export")
+    def export_knowledge_document(doc_id: str) -> PlainTextResponse:
+        try:
+            doc = ctx.get_document(doc_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        fname = quote(f"{doc.doc_id}.md")
+        return PlainTextResponse(
+            content=doc.body_markdown,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}"},
+        )
+
+    @app.post("/knowledge/documents", response_model=KnowledgeDocument)
+    def create_knowledge_document(req: DocumentUpsertRequest) -> KnowledgeDocument:
+        if req.doc_id:
+            req = req.model_copy(update={"doc_id": None})
+        try:
+            doc = ctx.upsert_knowledge_document(req)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store.save_knowledge_document(doc.doc_id, doc.model_dump_json(), doc.updated_at)
+        return doc
+
+    @app.put("/knowledge/documents/{doc_id}", response_model=KnowledgeDocument)
+    def update_knowledge_document(doc_id: str, req: DocumentUpsertRequest) -> KnowledgeDocument:
+        req = req.model_copy(update={"doc_id": doc_id})
+        try:
+            doc = ctx.upsert_knowledge_document(req)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store.save_knowledge_document(doc.doc_id, doc.model_dump_json(), doc.updated_at)
+        return doc
 
     @app.post("/reviews", response_model=ReviewRun)
     async def create_review(
