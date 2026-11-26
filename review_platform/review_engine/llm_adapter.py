@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import datetime
 import hashlib
 import ipaddress
@@ -22,6 +23,7 @@ from typing import Any, Callable, Optional, Protocol
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+import httpcore
 import httpx
 
 from review_platform.models import (
@@ -91,35 +93,73 @@ def get_llm_env_defaults_public() -> dict[str, Any]:
     }
 
 
+def _normalize_endpoint_url(provider: str, raw_endpoint: str) -> str:
+    """将不同 provider 的端点地址规范化用于同源绑定与白名单比对。"""
+    raw = raw_endpoint.strip()
+    if provider == "openai":
+        return (raw or DEFAULT_ENDPOINTS["openai"]).rstrip("/")
+    if provider == "claude":
+        return (raw or DEFAULT_ENDPOINTS["claude"]).rstrip("/")
+    if not raw:
+        return ""
+    ep = raw.rstrip("/")
+    if not (ep.endswith("/v1/chat/completions") or ep.endswith("/chat/completions")):
+        ep = f"{ep}/chat/completions" if ep.endswith("/v1") else f"{ep}/v1/chat/completions"
+    return ep
+
+
+def _endpoint_identity(url: str) -> Optional[tuple[str, str, int, str]]:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.query or parsed.fragment:
+        return None
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = (parsed.path or "/").rstrip("/") or "/"
+    return (parsed.scheme.lower(), parsed.hostname.lower(), port, path)
+
+
 def resolve_llm_config(user_cfg: Optional[LLMConfig]) -> LLMConfig:
-    """合并用户提交配置与可选服务端环境变量默认配置（严格同源隔离：自定义地址绝不复用服务端密钥）。"""
+    """合并用户提交配置与可选服务端环境变量默认配置（N7：环境密钥严格绑定服务端实际 provider 与 endpoint）。"""
+    env_provider = os.environ.get("REVIEW_LLM_PROVIDER", "openai").strip()
+    if env_provider not in ("openai", "claude", "custom"):
+        env_provider = "openai"
+    env_endpoint_raw = os.environ.get("REVIEW_LLM_ENDPOINT", "").strip()
+    env_key = os.environ.get("REVIEW_LLM_API_KEY", "").strip()
+
     if user_cfg is None:
         env_enabled = os.environ.get("REVIEW_LLM_ENABLED", "").strip().lower() in ("1", "true", "yes")
         if not env_enabled:
             return LLMConfig(enabled=False)
-        user_cfg = LLMConfig(enabled=True)
+        user_cfg = LLMConfig(enabled=True, provider=env_provider)
 
     if not user_cfg.enabled:
         return user_cfg
 
     provider = user_cfg.provider
     user_endpoint = user_cfg.endpoint.strip()
-    env_endpoint = os.environ.get("REVIEW_LLM_ENDPOINT", "").strip()
-    endpoint = user_endpoint or env_endpoint
-    model = user_cfg.model.strip() or os.environ.get("REVIEW_LLM_MODEL", "").strip() or DEFAULT_MODELS[provider]
+    effective_raw = user_endpoint or (env_endpoint_raw if provider == env_provider else "")
+    endpoint = effective_raw
+    model = user_cfg.model.strip() or (
+        os.environ.get("REVIEW_LLM_MODEL", "").strip() if provider == env_provider else ""
+    ) or DEFAULT_MODELS[provider]
 
-    # N2 修复：仅当 endpoint 未被用户自定义替换（即仍为服务端默认或官方默认）时，才允许回退服务端环境变量密钥
-    official_default = DEFAULT_ENDPOINTS.get(provider, "")
-    same_origin_as_server = (
-        not user_endpoint
-        or (env_endpoint and user_endpoint.rstrip("/") == env_endpoint.rstrip("/"))
-        or (official_default and user_endpoint.rstrip("/") == official_default.rstrip("/"))
+    server_norm = _normalize_endpoint_url(env_provider, env_endpoint_raw)
+    effective_norm = _normalize_endpoint_url(provider, effective_raw)
+    server_ident = _endpoint_identity(server_norm)
+    effective_ident = _endpoint_identity(effective_norm)
+    same_target_as_server = (
+        provider == env_provider
+        and server_ident is not None
+        and effective_ident is not None
+        and effective_ident == server_ident
     )
+
     user_key = user_cfg.api_key.strip()
     if user_key:
         api_key = user_key
-    elif same_origin_as_server:
-        api_key = os.environ.get("REVIEW_LLM_API_KEY", "").strip()
+    elif same_target_as_server:
+        api_key = env_key
     else:
         api_key = ""
 
@@ -315,32 +355,133 @@ def parse_model_json(response: str) -> dict[str, Any]:
     raise ValueError("模型返回的 JSON 无法解析与修复")
 
 
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+_LINK_LOCAL_V4_NET = ipaddress.ip_network("169.254.0.0/16")
+
+
+def _unwrap_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        return ip_obj.ipv4_mapped
+    return ip_obj
+
+
+def _is_always_blocked_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """链路本地（含云元数据 169.254.0.0/16）、组播与未指定地址即使在白名单下也一律阻断。"""
+    ip_obj = _unwrap_ip(ip_obj)
+    if ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified:
+        return True
+    if isinstance(ip_obj, ipaddress.IPv4Address) and ip_obj in _LINK_LOCAL_V4_NET:
+        return True
+    return False
+
+
 def _is_disallowed_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return (
-        ip_obj.is_private
+    """默认阻断所有非公网全球路由 IP（含 CGNAT 100.64.0.0/10、私网、环回、链路本地与映射地址）。"""
+    ip_obj = _unwrap_ip(ip_obj)
+    if (
+        (not ip_obj.is_global)
+        or ip_obj.is_private
         or ip_obj.is_loopback
         or ip_obj.is_link_local
         or ip_obj.is_multicast
         or ip_obj.is_reserved
         or ip_obj.is_unspecified
-    )
+    ):
+        return True
+    if isinstance(ip_obj, ipaddress.IPv4Address) and ip_obj in _CGNAT_NET:
+        return True
+    return False
 
 
-def _validate_ssrf_target(endpoint: str) -> None:
-    """N3 修复：拒绝内网/环回/链路本地（云元数据）地址及 query/fragment 注入。"""
+def _local_allowlist_identities() -> set[tuple[str, str, int, str]]:
+    """读取管理员显式配置的精确本地白名单（REVIEW_LLM_LOCAL_ALLOWLIST）。"""
+    raw = os.environ.get("REVIEW_LLM_LOCAL_ALLOWLIST", "").strip()
+    if not raw:
+        return set()
+    allowed: set[tuple[str, str, int, str]] = set()
+    for entry in raw.split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        exact_ident = _endpoint_identity(item)
+        if exact_ident is not None:
+            allowed.add(exact_ident)
+        norm_ident = _endpoint_identity(_normalize_endpoint_url("custom", item))
+        if norm_ident is not None:
+            allowed.add(norm_ident)
+    return allowed
+
+
+def _is_allowlisted_local_endpoint(endpoint: str) -> bool:
+    ident = _endpoint_identity(endpoint)
+    if ident is None:
+        return False
+    return ident in _local_allowlist_identities()
+
+
+class _PinnedSyncBackend(httpcore.SyncBackend):
+    """N8 修复：固定 DNS 校验阶段解析出的已验证 IP，阻断二次 DNS 重绑定并在建连后复核对端 IP。"""
+
+    def __init__(
+        self,
+        expected_host: str,
+        expected_port: int,
+        pinned_ip: Optional[str],
+        allow_local: bool,
+    ) -> None:
+        self.expected_host = expected_host.lower()
+        self.expected_port = expected_port
+        self.pinned_ip = pinned_ip
+        self.allow_local = allow_local
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: Optional[float] = None,
+        local_address: Optional[str] = None,
+        socket_options: Any = None,
+    ) -> httpcore.NetworkStream:
+        if host.lower() != self.expected_host or port != self.expected_port:
+            raise ValueError("SSRF 防护拦截：目标主机或端口与校验阶段不一致")
+        if not self.pinned_ip:
+            raise ValueError("目标域名 DNS 解析失败或未通过 SSRF 校验")
+
+        stream = super().connect_tcp(
+            self.pinned_ip,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+        sock = stream.get_extra_info("socket")
+        if sock is not None:
+            try:
+                peer = sock.getpeername()
+                if peer:
+                    peer_ip = ipaddress.ip_address(str(peer[0]).split("%")[0])
+                    if _is_always_blocked_ip(peer_ip) or (not self.allow_local and _is_disallowed_ip(peer_ip)):
+                        stream.close()
+                        raise ValueError("连接对端 IP 未通过 SSRF 复核")
+            except ValueError:
+                raise
+            except Exception:
+                stream.close()
+                raise ValueError("无法复核连接对端 IP")
+        return stream
+
+
+def _validate_and_pin_target(endpoint: str) -> tuple[Optional[str], bool]:
+    """N8 修复：校验目标 URL 并单次解析固定 IP（无全局开关绕过；私网仅限精确白名单）。"""
     parsed = urlparse(endpoint)
     if parsed.scheme not in ("http", "https") or not parsed.netloc or not parsed.hostname:
         raise ValueError("接口地址必须为合法的 http:// 或 https:// URL")
     if parsed.query or parsed.fragment:
         raise ValueError("接口地址不允许包含查询参数 (?) 或锚点 (#)")
 
-    allow_local = os.environ.get("REVIEW_LLM_ALLOW_LOCAL", "").strip().lower() in ("1", "true", "yes")
-    if allow_local:
-        return
-
     host = parsed.hostname.lower()
-    if host in ("localhost", "ip6-localhost") or host.endswith((".local", ".internal")):
-        raise ValueError("默认禁止访问本机或内网域名（如需本机 Ollama 请设置 REVIEW_LLM_ALLOW_LOCAL=1）")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    allowlisted = _is_allowlisted_local_endpoint(endpoint)
 
     try:
         ip_lit = ipaddress.ip_address(host)
@@ -348,25 +489,41 @@ def _validate_ssrf_target(endpoint: str) -> None:
         ip_lit = None
 
     if ip_lit is not None:
-        if _is_disallowed_ip(ip_lit):
-            raise ValueError("默认禁止访问私有网段、环回或链路本地地址（SSRF 防护）")
-        return
+        unwrapped = _unwrap_ip(ip_lit)
+        if _is_always_blocked_ip(unwrapped):
+            raise ValueError("禁止访问链路本地、云元数据或组播地址（SSRF 防护）")
+        if not allowlisted and _is_disallowed_ip(unwrapped):
+            raise ValueError("默认禁止访问非公网、环回或 CGNAT 地址（本地模型需管理员配置 REVIEW_LLM_LOCAL_ALLOWLIST）")
+        return str(unwrapped), allowlisted
+
+    if not allowlisted and (
+        host in ("localhost", "ip6-localhost") or host.endswith((".localhost", ".local", ".internal"))
+    ):
+        raise ValueError("默认禁止访问本机或内网域名（本地模型需管理员配置 REVIEW_LLM_LOCAL_ALLOWLIST）")
 
     try:
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        for info in infos:
-            sockaddr = info[4]
-            if sockaddr:
-                resolved_ip = ipaddress.ip_address(sockaddr[0].split("%")[0])
-                if _is_disallowed_ip(resolved_ip):
-                    raise ValueError("目标域名解析到受限内网或链路本地地址（SSRF 防护）")
     except socket.gaierror:
-        # 离线/测试环境允许继续交给传输层或 MockTransport 处理
-        pass
+        # 离线/MockTransport 测试环境允许交由注入客户端处理；真实连接会在 _PinnedSyncBackend 拦截
+        return None, allowlisted
+
+    pinned_ip: Optional[str] = None
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        resolved_ip = _unwrap_ip(ipaddress.ip_address(str(sockaddr[0]).split("%")[0]))
+        if _is_always_blocked_ip(resolved_ip):
+            raise ValueError("目标域名解析到链路本地或云元数据受限地址（SSRF 防护）")
+        if not allowlisted and _is_disallowed_ip(resolved_ip):
+            raise ValueError("目标域名解析到非公网受限地址（SSRF 防护）")
+        if pinned_ip is None:
+            pinned_ip = str(resolved_ip)
+
+    return pinned_ip, allowlisted
 
 
-def _resolve_endpoint(config: LLMConfig) -> str:
+def _resolve_endpoint(config: LLMConfig) -> tuple[str, Optional[str], bool]:
     raw = config.endpoint.strip()
     if config.provider == "openai":
         ep = raw or DEFAULT_ENDPOINTS["openai"]
@@ -382,8 +539,8 @@ def _resolve_endpoint(config: LLMConfig) -> str:
         if not (ep.endswith("/v1/chat/completions") or ep.endswith("/chat/completions")):
             ep = f"{ep}/chat/completions" if ep.endswith("/v1") else f"{ep}/v1/chat/completions"
 
-    _validate_ssrf_target(ep)
-    return ep
+    pinned_ip, allowlisted = _validate_and_pin_target(ep)
+    return ep, pinned_ip, allowlisted
 
 
 def _is_local_endpoint(endpoint: str) -> bool:
@@ -400,15 +557,28 @@ def call_llm_completion(
     client_factory: Optional[Callable[[float], httpx.Client]] = None,
 ) -> str:
     """调用用户配置的大模型（OpenAI / Claude / 自定义兼容接口）。"""
-    endpoint = _resolve_endpoint(config)
+    endpoint, pinned_ip, allowlisted = _resolve_endpoint(config)
     model = config.model.strip() or DEFAULT_MODELS[config.provider]
     api_key = config.api_key.strip()
 
-    if not api_key and not (config.provider == "custom" and _is_local_endpoint(endpoint)):
+    if not api_key and not (config.provider == "custom" and allowlisted and _is_local_endpoint(endpoint)):
         raise ValueError("请提供有效的 API Key")
 
     max_tokens = max_tokens_override or config.max_tokens
-    make_client = client_factory or (lambda t: httpx.Client(timeout=t, follow_redirects=False))
+
+    def _default_client(t: float) -> httpx.Client:
+        parsed = urlparse(endpoint)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        transport = httpx.HTTPTransport()
+        transport._pool._network_backend = _PinnedSyncBackend(
+            expected_host=(parsed.hostname or "").lower(),
+            expected_port=port,
+            pinned_ip=pinned_ip,
+            allow_local=allowlisted,
+        )
+        return httpx.Client(timeout=t, follow_redirects=False, transport=transport)
+
+    make_client = client_factory or _default_client
 
     with make_client(config.timeout_seconds) as client:
         if config.provider == "claude":
@@ -550,6 +720,18 @@ def _locate_quote_anchor(
     )
 
 
+@dataclass
+class AISemanticRunResult:
+    """单条受控 AI 语义规则执行结果与完整度元数据（独立于是否产出 Finding）。"""
+
+    findings: list[Finding]
+    checked_count: int
+    excluded_count: int
+    context_truncated: bool
+    input_chars: int
+    target_blocks: int
+
+
 def run_semantic_rule_with_llm(
     rule: RuleSpec,
     document: DocumentIR,
@@ -558,8 +740,8 @@ def run_semantic_rule_with_llm(
     basis_source: str,
     *,
     client_factory: Optional[Callable[[float], httpx.Client]] = None,
-) -> tuple[list[Finding], int, int]:
-    """执行单条受控 AI 语义规则，返回待 FindingEngine 门禁核验的候选意见。"""
+) -> AISemanticRunResult:
+    """执行单条受控 AI 语义规则，返回待 FindingEngine 门禁核验的候选意见与结构化截断元数据。"""
     applies_to = set(rule.applies_to) if rule.applies_to else None
     target_blocks = [
         b
@@ -567,11 +749,19 @@ def run_semantic_rule_with_llm(
         if b.kind != "separator" and (not applies_to or b.section in applies_to)
     ]
     if not target_blocks:
-        return [], 0, 0
+        return AISemanticRunResult(
+            findings=[],
+            checked_count=0,
+            excluded_count=0,
+            context_truncated=False,
+            input_chars=0,
+            target_blocks=0,
+        )
 
     manuscript_lines = [f"[{b.id} | {b.section_cn}] {b.text}" for b in target_blocks]
     manuscript_text = "\n".join(manuscript_lines)
-    context_truncated = len(manuscript_text) > 24000
+    input_chars = len(manuscript_text)
+    context_truncated = input_chars > 24000
     # 防止超长稿件撑爆单次上下文，保守截断到约 24000 字符并显式标记
     if context_truncated:
         manuscript_text = manuscript_text[:24000] + "\n…（后续内容超出单次模型上下文预算已截断）"
@@ -663,7 +853,14 @@ def run_semantic_rule_with_llm(
             )
         )
 
-    return findings, len(target_blocks), excluded
+    return AISemanticRunResult(
+        findings=findings,
+        checked_count=len(target_blocks),
+        excluded_count=excluded,
+        context_truncated=context_truncated,
+        input_chars=input_chars,
+        target_blocks=len(target_blocks),
+    )
 
 
 class AICandidateExecutor(Protocol):

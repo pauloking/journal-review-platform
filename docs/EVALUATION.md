@@ -22,7 +22,7 @@
 
 ## 3. 历史回归与当前实测基线（2026-11-26）
 
-- **本平台自动化测试（`.venv/bin/python -m pytest -v`，Python 3.12.13）**：实测 **31/31 全部通过**，覆盖 `DocumentIR` 安全解析与锚点、Knowledge/Registry/Router DAG、P 值/百分比/题注/复用规则正反边界例外、规则文档无损往返与重启保持、ReDoS 花括号量词与 `regex` 超时熔断、`advanced_params` 校验、流式上传限额与 ZIP 炸弹拦截、Bearer RBAC 鉴权与前端会话令牌栏、同段多批注 Word 导出、受控大模型（OpenAI/Claude/自定义兼容接口）并行执行与锚点/幻觉拦截门禁、服务端密钥同源隔离、SSRF 阻断与错误脱敏、LLM 维度幂等键与长稿 24,000 字截断降级披露、乐观并发裁决、综合报告导出及 CLI 全流程。
+- **本平台自动化测试（`.venv/bin/python -m pytest -v`，Python 3.12.13）**：实测 **35/35 全部通过**，覆盖 `DocumentIR` 安全解析与锚点、Knowledge/Registry/Router DAG、P 值/百分比/题注/复用规则正反边界例外、规则文档无损往返与重启保持、ReDoS 花括号量词与 `regex` 超时熔断、`advanced_params` 校验、流式上传限额与 ZIP 炸弹拦截、Bearer RBAC 鉴权与前端会话令牌栏、同段多批注 Word 导出、受控大模型（OpenAI/Claude/自定义兼容接口）并行执行与锚点/幻觉拦截门禁、服务端密钥严格同源同 provider 绑定、SSRF 防线（CGNAT/IPv4 映射地址阻断、DNS 解析 IP 固定防重绑定、`REVIEW_LLM_LOCAL_ALLOWLIST` 精确白名单与错误脱敏）、LLM 维度幂等键、长稿与短段多块带前缀 24,000 字截断结构化元数据披露、乐观并发裁决、综合报告导出及 CLI 全流程。
 - **历史基线核对（未改动原仓库）**：
   - `medical-journal-copyediting-2.0.0`：`scripts/tests/run_tests.py` 实测 `25/25` 通过（`F1=1.000`）。
   - `medical-journal-reviewer`：`npm test`（Vitest）实测 9 个文件 `95/95` 通过，`npm run build` 构建通过。

@@ -100,8 +100,8 @@
 - **实时可控接入与并行执行**：`review_platform/review_engine/llm_adapter.py` 已实现 OpenAI、Claude (Anthropic) 及自定义兼容接口（DeepSeek / GLM / Qwen / Ollama / OneAPI）适配器；启用时通过 `ThreadPoolExecutor` 按激活的 AI 维度并发调用，支持关闭推理思考链（`enable_thinking: false`）与连接测试 `/llm/test`。
 - **端到端安全防线与门禁**：
   1. **密钥同源隔离与会话存储**：前端将 LLM 配置与 API Key 仅存放在标签页级 `sessionStorage`（关闭即清除）；后端严格校验仅当 `endpoint` 与服务端默认地址同源时才允许回落使用环境变量 `REVIEW_LLM_API_KEY`，严禁向第三方自定义地址发送服务端密钥；
-  2. **SSRF 与错误脱敏**：拒绝含 query/fragment 的 URL、禁止重定向并阻断 `localhost` / 内网 / 云元数据（`169.254.0.0/16`）IP（私有本地测试需显式设 `REVIEW_LLM_ALLOW_LOCAL=1`）；上游非 2xx 错误仅摘要状态码与结构化错误码，不透传原始响应体；
-  3. **真实门禁与长稿截断显式降级**：AI 候选均经 `extract_json_block` / `repair_json` 容错、动态日期防误判过滤、`Anchor` 逐字定位与 `basis_id` 校验；单稿超过 24,000 字符截断送审时，强制写入 `document.limitations` 并降级状态为 `complete_with_limitations`。
+  2. **SSRF 与错误脱敏**：拒绝含 query/fragment 的 URL、禁止重定向并默认阻断所有非公网全球路由 IP（含 `localhost` / 内网 / CGNAT `100.64.0.0/10` / 云元数据 `169.254.0.0/16` 及 DNS 重绑定），私有本地模型仅限通过 `REVIEW_LLM_LOCAL_ALLOWLIST` 精确登记 `host + port + path`；上游非 2xx 错误仅摘要状态码与结构化错误码，不透传原始响应体；
+  3. **真实门禁与长稿截断显式降级**：AI 候选均经 `extract_json_block` / `repair_json` 容错、动态日期防误判过滤、`Anchor` 逐字定位与 `basis_id` 校验；单次带块前缀上下文超过 24,000 字符截断时，无论是否产出 Finding 均通过独立任务元数据记录 `context_truncated_24k`、强制写入 `document.limitations` 并降级状态为 `complete_with_limitations`。
 
 ---
 

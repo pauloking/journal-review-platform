@@ -325,3 +325,203 @@ def test_n4_and_i3_run_seed_includes_llm_dims_and_truncation_disclosure(tmp_path
     assert any("24,000" in msg or "截断" in msg for msg in r1["document"]["limitations"])
     ai_done = [t for t in r1["plan"]["tasks"] if t["node_id"] == "AI-LANGUAGE-STYLE"][0]
     assert "context_truncated_24k" in ai_done["reason"]
+
+
+def test_n7_env_key_strictly_bound_to_server_endpoint_not_official_default(tmp_path: Path, monkeypatch):
+    """N7 回归：服务端配置自定义厂商时，用户切到 OpenAI 官方默认地址严禁注入自定义厂商环境变量密钥。"""
+    monkeypatch.setenv("REVIEW_LLM_PROVIDER", "custom")
+    monkeypatch.setenv("REVIEW_LLM_ENDPOINT", "https://custom-vendor.example.com/v1")
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "sk-CUSTOM-VENDOR-SECRET")
+
+    captured: list[dict] = []
+    factory = _mock_client_factory(captured, lambda r, b: (200, {"choices": [{"message": {"content": "ok"}}]}))
+    client = TestClient(create_app(db_path=tmp_path / "n7.sqlite3", llm_client_factory=factory))
+
+    res = client.post(
+        "/llm/test",
+        json={
+            "enabled": True,
+            "provider": "openai",
+            "endpoint": "https://api.openai.com/v1/chat/completions",
+            "api_key": "",
+            "model": "gpt-4o-mini",
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["ok"] is False
+    assert captured == []
+    assert "sk-CUSTOM-VENDOR-SECRET" not in json.dumps(data)
+
+
+def test_n8_ssrf_cgnat_allowlist_and_dns_rebinding_pinning(tmp_path: Path, monkeypatch):
+    """N8 回归：拦截 CGNAT、失效 REVIEW_LLM_ALLOW_LOCAL、支持精确白名单并固定 DNS 解析防重绑定。"""
+    import socket
+    import httpcore
+    from review_platform.models import LLMConfig
+    from review_platform.review_engine import llm_adapter
+
+    captured: list[dict] = []
+    factory = _mock_client_factory(captured, lambda r, b: (200, {"choices": [{"message": {"content": "ok"}}]}))
+    client = TestClient(create_app(db_path=tmp_path / "n8.sqlite3", llm_client_factory=factory))
+
+    # 1. CGNAT 与 IPv4-mapped IPv6 环回地址必须被拦截
+    for bad_ep in ["http://100.64.0.1/v1", "http://[::ffff:127.0.0.1]:8080/v1"]:
+        r = client.post(
+            "/llm/test",
+            json={
+                "enabled": True,
+                "provider": "custom",
+                "endpoint": bad_ep,
+                "api_key": "sk-user",
+                "model": "test",
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["ok"] is False
+
+    # 2. 旧的 REVIEW_LLM_ALLOW_LOCAL=1 布尔开关不再放行 169.254.169.254 或未登记私网
+    monkeypatch.setenv("REVIEW_LLM_ALLOW_LOCAL", "1")
+    r_meta = client.post(
+        "/llm/test",
+        json={
+            "enabled": True,
+            "provider": "custom",
+            "endpoint": "http://169.254.169.254/latest/meta-data",
+            "api_key": "sk-user",
+            "model": "test",
+        },
+    )
+    assert r_meta.status_code == 200
+    assert r_meta.json()["ok"] is False
+    assert captured == []
+
+    # 3. 精确白名单 REVIEW_LLM_LOCAL_ALLOWLIST 仅放行已登记的 host+port+path（本地可免 key）
+    monkeypatch.delenv("REVIEW_LLM_ALLOW_LOCAL", raising=False)
+    monkeypatch.setenv("REVIEW_LLM_LOCAL_ALLOWLIST", "http://127.0.0.1:11434/v1")
+    r_ollama = client.post(
+        "/llm/test",
+        json={
+            "enabled": True,
+            "provider": "custom",
+            "endpoint": "http://127.0.0.1:11434/v1",
+            "api_key": "",
+            "model": "qwen2.5",
+        },
+    )
+    assert r_ollama.status_code == 200
+    assert r_ollama.json()["ok"] is True
+    assert len(captured) == 1
+
+    # 未在白名单的 127.0.0.1:8080 仍拦截
+    r_other_local = client.post(
+        "/llm/test",
+        json={
+            "enabled": True,
+            "provider": "custom",
+            "endpoint": "http://127.0.0.1:8080/v1",
+            "api_key": "sk-user",
+            "model": "test",
+        },
+    )
+    assert r_other_local.status_code == 200
+    assert r_other_local.json()["ok"] is False
+
+    # 4. DNS 重绑定：首次 getaddrinfo 返回公网 IP，后续再调用会返回 127.0.0.1；
+    #    验证默认客户端使用固定 IP 直连且绝不触发二次解析到 127.0.0.1
+    monkeypatch.delenv("REVIEW_LLM_LOCAL_ALLOWLIST", raising=False)
+    calls = {"n": 0}
+
+    def _rebind_getaddrinfo(host, port, *args, **kwargs):
+        calls["n"] += 1
+        ip = "93.184.216.34" if calls["n"] == 1 else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, int(port or 80)))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", _rebind_getaddrinfo)
+
+    dialed_hosts: list[str] = []
+
+    class _FakeStream(httpcore.NetworkStream):
+        def __init__(self) -> None:
+            body = b'{"choices":[{"message":{"content":"ok"}}]}'
+            self._buf = (
+                f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n"
+                f"Content-Type: application/json\r\n\r\n"
+            ).encode("ascii") + body
+            self._pos = 0
+
+        def read(self, max_bytes, timeout=None):
+            chunk = self._buf[self._pos : self._pos + max_bytes]
+            self._pos += len(chunk)
+            return chunk
+
+        def write(self, buffer, timeout=None):
+            pass
+
+        def close(self):
+            pass
+
+        def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+            return self
+
+        def get_extra_info(self, info):
+            return None
+
+    def _fake_super_connect(self, host, port, timeout=None, local_address=None, socket_options=None):
+        dialed_hosts.append(host)
+        return _FakeStream()
+
+    monkeypatch.setattr(httpcore.SyncBackend, "connect_tcp", _fake_super_connect)
+    reply = llm_adapter.call_llm_completion(
+        LLMConfig(
+            enabled=True,
+            provider="custom",
+            endpoint="http://rebind.example.com/v1",
+            api_key="sk-test",
+            model="test",
+        ),
+        "sys",
+        "usr",
+    )
+    assert reply == "ok"
+    assert dialed_hosts == ["93.184.216.34"]
+    assert calls["n"] == 1
+
+
+def test_n9_short_paragraphs_truncation_disclosed_even_with_zero_findings(tmp_path: Path):
+    """N9 回归：大量短段落致带前缀提示词超 24k 但原文不足 24k 且 AI 返回零意见时，仍须披露截断。"""
+    captured: list[dict] = []
+    factory = _mock_client_factory(
+        captured,
+        lambda r, b: (200, {"choices": [{"message": {"content": json.dumps({"findings": []})}}]}),
+    )
+    client = TestClient(create_app(db_path=tmp_path / "n9.sqlite3", llm_client_factory=factory))
+
+    # 1,500 个 3 字短段：原文仅 ~4,500 字（<24,000），但带 "[Pxxxx | 方法] " 前缀超过 24,000 字
+    paras = ["短句。", "摘要：短句测试。", "1 方法"] + ["短样本" for _ in range(1500)]
+    raw = make_docx_bytes(paras)
+    res = client.post(
+        "/reviews?journal=general-medical-cn",
+        data={
+            "llm_config": json.dumps(
+                {
+                    "enabled": True,
+                    "provider": "openai",
+                    "api_key": "sk-k1",
+                    "model": "gpt-4o-mini",
+                    "enabled_rules": ["AI-LANGUAGE-STYLE"],
+                }
+            )
+        },
+        files={"file": ("short_many.docx", raw, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    assert res.status_code == 200
+    run = res.json()
+    assert run["document"]["profile"]["char_count"] < 24000
+    ai_task = [t for t in run["plan"]["tasks"] if t["node_id"] == "AI-LANGUAGE-STYLE"][0]
+    assert ai_task["finding_count"] == 0
+    assert ai_task["metadata"]["context_truncated"] is True
+    assert ai_task["metadata"]["input_chars"] > 24000
+    assert "context_truncated_24k" in ai_task["reason"]
+    assert run["status"] == "complete_with_limitations"
+    assert any("24,000" in msg or "截断" in msg for msg in run["document"]["limitations"])

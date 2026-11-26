@@ -392,7 +392,10 @@ class PlatformContext:
         else:
             llm_tag = "off"
 
-        ai_truncated = any("context_truncated_24k" in (t.reason or "") for t in final_plan.tasks)
+        ai_truncated = any(
+            bool(t.metadata.get("context_truncated")) or "context_truncated_24k" in (t.reason or "")
+            for t in final_plan.tasks
+        )
         if ai_truncated:
             lim_msg = "AI 语义审校单次上下文仅覆盖前 24,000 字符，超出部分已截断、未纳入本次语义核查。"
             if lim_msg not in doc_ir.limitations:

@@ -22,7 +22,11 @@ from review_platform.models import (
     ReviewTask,
 )
 from review_platform.review_engine.fact_extractor import extract_facts
-from review_platform.review_engine.llm_adapter import resolve_llm_config, run_semantic_rule_with_llm
+from review_platform.review_engine.llm_adapter import (
+    AISemanticRunResult,
+    resolve_llm_config,
+    run_semantic_rule_with_llm,
+)
 from review_platform.review_engine.pattern_executor import execute_pattern_rule
 from review_platform.rule_registry import RuleRegistry
 
@@ -393,7 +397,7 @@ def execute_plan(
 
     # 并发执行就绪的 AI 语义审校任务，显著缩短端到端等待时间
     if pending_ai_indices:
-        def _run_one(task_obj: ReviewTask) -> tuple[list[Finding], int, int]:
+        def _run_one(task_obj: ReviewTask) -> AISemanticRunResult:
             r = registry.get(task_obj.rule_id)
             c = knowledge.get_clause(r.basis_id)
             return run_semantic_rule_with_llm(
@@ -409,15 +413,19 @@ def execute_plan(
             futures = [(idx, t, pool.submit(_run_one, t)) for idx, t in pending_ai_indices]
             for idx, t, fut in futures:
                 try:
-                    f_list, chk, exc = fut.result()
+                    ai_res = fut.result()
+                    f_list = ai_res.findings
                     raw_findings.extend(f_list)
-                    t.checked_count = chk
-                    t.excluded_count = exc
+                    t.checked_count = ai_res.checked_count
+                    t.excluded_count = ai_res.excluded_count
                     t.finding_count = len(f_list)
                     t.status = "findings" if f_list else "passed"
-                    trunc_note = ""
-                    if any(bool(f.evidence.get("context_truncated")) for f in f_list) or sum(len(b.text) for b in document.blocks) > 24000:
-                        trunc_note = ", context_truncated_24k"
+                    t.metadata = {
+                        "context_truncated": ai_res.context_truncated,
+                        "input_chars": ai_res.input_chars,
+                        "target_blocks": ai_res.target_blocks,
+                    }
+                    trunc_note = ", context_truncated_24k" if ai_res.context_truncated else ""
                     t.reason = (
                         f"ai_findings:{len(f_list)} ({resolved_llm.provider}/{resolved_llm.model}{trunc_note})"
                         if f_list

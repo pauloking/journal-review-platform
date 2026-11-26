@@ -90,24 +90,6 @@ def _is_separator(text):
     return bool(clean and len(clean) >= 4 and re.fullmatch(r"[*＊_—－-]+", clean))
 
 
-def _is_reference_entry(text):
-    """识别带编号或不带编号的中英文文后条目。"""
-    clean = text.strip()
-    if len(clean) < 12:
-        return False
-    numbered = bool(re.match(r"^[\[［〔]?\d+[\]］〕．.、)]\s*", clean))
-    doc_type = bool(re.search(r"\[[A-Za-z]/?[A-Za-z]?\]", clean))
-    year = bool(re.search(r"(?:19|20)\d{2}", clean))
-    journal_tail = bool(re.search(
-        r"(?:19|20)\d{2}\s*[,，]\s*\d+(?:\s*[（(]\d+[）)])?\s*[:：]\s*\d+", clean))
-    doi = bool(re.search(r"(?:doi|10\.\d{4,}|https?://)", clean, re.I))
-    authorish = bool(re.match(
-        r"^(?:[\u4e00-\u9fff]{2,4}[,，、]|[A-Z][A-Za-z'’-]+(?:\s+[A-Z]{1,3})?[,，])", clean))
-    bracket_numbered = bool(re.match(r"^[\[［〔]\d+[\]］〕]", clean))
-    return (numbered and (doc_type or year or journal_tail or doi or bracket_numbered)) or (
-        authorish and (doc_type or journal_tail or doi))
-
-
 def _find_reference_start(lines):
     """用连续条目回溯无标题参考文献的起点。"""
     flags = [_is_reference_entry((x if isinstance(x, str) else x.get("text", "")))

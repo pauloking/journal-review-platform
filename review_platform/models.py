@@ -229,6 +229,7 @@ class ReviewTask(BaseModel):
     checked_count: int = 0
     excluded_count: int = 0
     finding_count: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExecutionTraceStep(BaseModel):

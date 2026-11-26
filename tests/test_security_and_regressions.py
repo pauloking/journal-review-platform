@@ -439,3 +439,11 @@ def test_n6_advanced_params_type_and_regex_validation(tmp_path: Path):
         },
     )
     assert bad_type_res.status_code == 422
+
+
+def test_n10_shared_reference_entry_helper_used():
+    """N10 回归：结构适配器不再保留遮蔽共享工具的重复实现。"""
+    from review_platform.adapters import legacy_structure
+    from review_platform.document_engine import text_utils
+
+    assert legacy_structure._is_reference_entry is text_utils.is_reference_entry

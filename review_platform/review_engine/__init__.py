@@ -4,6 +4,7 @@ from .executor import execute_plan
 from .fact_extractor import extract_facts
 from .llm_adapter import (
     AICandidateExecutor,
+    AISemanticRunResult,
     build_time_anchored_system_prompt,
     extract_json_block,
     get_llm_env_defaults_public,
@@ -17,6 +18,7 @@ from .llm_adapter import (
 
 __all__ = [
     "AICandidateExecutor",
+    "AISemanticRunResult",
     "build_time_anchored_system_prompt",
     "execute_plan",
     "extract_facts",
