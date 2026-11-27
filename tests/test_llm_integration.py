@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from pathlib import Path
 
 import httpx
@@ -8,6 +9,17 @@ from fastapi.testclient import TestClient
 
 from review_platform.api import create_app
 from tests.conftest import make_docx_bytes
+
+
+def _stub_public_dns(monkeypatch, public_ip: str = "93.184.216.34") -> None:
+    """R07 修复：在注入 MockTransport 的传输层测试中固定公网解析结果，避免依赖本机/公网 DNS。"""
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (public_ip, int(port or 443)))
+        ],
+    )
 
 
 def _mock_client_factory(captured_requests: list[dict], response_builder):
@@ -43,7 +55,8 @@ def test_llm_defaults_and_disabled_skip_trace(tmp_path: Path):
     assert all(t["status"] == "skipped" and t["reason"] == "llm_not_configured" for t in ai_tasks)
 
 
-def test_llm_test_connection_and_custom_endpoint_normalization(tmp_path: Path):
+def test_llm_test_connection_and_custom_endpoint_normalization(tmp_path: Path, monkeypatch):
+    _stub_public_dns(monkeypatch)
     captured: list[dict] = []
 
     def _resp(req: httpx.Request, body: dict):
@@ -88,7 +101,8 @@ def test_llm_test_connection_and_custom_endpoint_normalization(tmp_path: Path):
     assert captured[1]["headers"].get("x-api-key") == "sk-ant-test"
 
 
-def test_llm_semantic_review_with_anchor_gate_and_key_isolation(tmp_path: Path):
+def test_llm_semantic_review_with_anchor_gate_and_key_isolation(tmp_path: Path, monkeypatch):
+    _stub_public_dns(monkeypatch)
     captured: list[dict] = []
 
     def _resp(req: httpx.Request, body: dict):
@@ -199,8 +213,9 @@ def test_n2_server_api_key_isolated_from_custom_endpoint(tmp_path: Path, monkeyp
     assert "sk-SERVER-SECRET-NEVER-LEAK" not in json.dumps(data)
 
 
-def test_n3_ssrf_targets_blocked_and_upstream_body_sanitized(tmp_path: Path):
+def test_n3_ssrf_targets_blocked_and_upstream_body_sanitized(tmp_path: Path, monkeypatch):
     """N3 回归：阻断元数据/回环/带查询参数的 SSRF 地址，且不回显上游原始错误体。"""
+    _stub_public_dns(monkeypatch)
     captured: list[dict] = []
 
     def _err_resp(req: httpx.Request, body: dict):
@@ -247,8 +262,9 @@ def test_n3_ssrf_targets_blocked_and_upstream_body_sanitized(tmp_path: Path):
     assert "SECRET_INTERNAL_STACK_TRACE_LEAK" not in err_data["message"]
 
 
-def test_n4_and_i3_run_seed_includes_llm_dims_and_truncation_disclosure(tmp_path: Path):
+def test_n4_and_i3_run_seed_includes_llm_dims_and_truncation_disclosure(tmp_path: Path, monkeypatch):
     """N4 & i3 回归：不同 enabled_rules/temperature 生成不同 run_id；超过 24,000 字时显式披露截断并降级状态。"""
+    _stub_public_dns(monkeypatch)
     captured: list[dict] = []
 
     def _resp(req: httpx.Request, body: dict):
@@ -488,8 +504,9 @@ def test_n8_ssrf_cgnat_allowlist_and_dns_rebinding_pinning(tmp_path: Path, monke
     assert calls["n"] == 1
 
 
-def test_n9_short_paragraphs_truncation_disclosed_even_with_zero_findings(tmp_path: Path):
+def test_n9_short_paragraphs_truncation_disclosed_even_with_zero_findings(tmp_path: Path, monkeypatch):
     """N9 回归：大量短段落致带前缀提示词超 24k 但原文不足 24k 且 AI 返回零意见时，仍须披露截断。"""
+    _stub_public_dns(monkeypatch)
     captured: list[dict] = []
     factory = _mock_client_factory(
         captured,
@@ -525,3 +542,219 @@ def test_n9_short_paragraphs_truncation_disclosed_even_with_zero_findings(tmp_pa
     assert "context_truncated_24k" in ai_task["reason"]
     assert run["status"] == "complete_with_limitations"
     assert any("24,000" in msg or "截断" in msg for msg in run["document"]["limitations"])
+
+
+def test_r01_retry_after_failure_returns_new_run_preserves_failure_and_decisions(tmp_path: Path, monkeypatch):
+    """R01 回归：首次 AI 失败后按同配置重试返回最新成功结果，保留首轮失败记录与既有裁决，健康后再次提交幂等复用。"""
+    _stub_public_dns(monkeypatch)
+    state = {"call": 0}
+    captured: list[dict] = []
+
+    def _resp(req: httpx.Request, body: dict):
+        state["call"] += 1
+        if state["call"] == 1:
+            return 503, {"error": {"message": "upstream temporary unavailable", "code": "temp_503"}}
+        return 200, {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "findings": [
+                                    {
+                                        "blockId": "P0002",
+                                        "originalText": "有效率达80%",
+                                        "description": "摘要与结果数值核对提示",
+                                        "suggestion": "核对有效率百分比",
+                                        "reason": "摘要核验",
+                                        "severity": "warning",
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+
+    factory = _mock_client_factory(captured, _resp)
+    client = TestClient(create_app(db_path=tmp_path / "r01.sqlite3", llm_client_factory=factory))
+    raw = make_docx_bytes(["冠心病研究", "摘要：有效率达80%，同时实测P=1.25。", "1 结果", "有效率为65%。"])
+    llm_cfg = json.dumps(
+        {
+            "enabled": True,
+            "provider": "openai",
+            "api_key": "sk-k1",
+            "model": "gpt-4o-mini",
+            "enabled_rules": ["AI-ABSTRACT-CONSISTENCY"],
+        }
+    )
+    files = {"file": ("retry.docx", raw, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")}
+
+    # 1. 首次运行：503 导致 AI 任务 failed
+    r1 = client.post("/reviews?journal=general-medical-cn", data={"llm_config": llm_cfg}, files=files).json()
+    ai_t1 = [t for t in r1["plan"]["tasks"] if t["node_id"] == "AI-ABSTRACT-CONSISTENCY"][0]
+    assert ai_t1["status"] == "failed"
+
+    # 对首轮确定性意见做一条裁决，确认不会被后续重试冲掉
+    det_f = next(f for f in r1["findings"] if f["source_type"] == "deterministic")
+    d_res = client.post(
+        f"/reviews/{r1['run_id']}/decisions",
+        json={
+            "finding_id": det_f["id"],
+            "action": "accept",
+            "editor": "张编辑",
+            "reason": "保留首轮裁决记录",
+            "expected_revision": 0,
+        },
+    )
+    assert d_res.status_code == 200
+
+    # 2. 原参数重试：上游恢复 200，客户端必须拿到新的成功结果
+    r2 = client.post("/reviews?journal=general-medical-cn", data={"llm_config": llm_cfg}, files=files).json()
+    assert r2["run_id"] != r1["run_id"]
+    assert r2["retry_of"] == r1["run_id"]
+    ai_t2 = [t for t in r2["plan"]["tasks"] if t["node_id"] == "AI-ABSTRACT-CONSISTENCY"][0]
+    assert ai_t2["status"] == "findings"
+    assert any(f["rule_id"] == "AI-ABSTRACT-CONSISTENCY" for f in r2["findings"])
+
+    # 首轮失败记录和其既有裁决依然可追溯且完整保留
+    stored_r1 = client.get(f"/reviews/{r1['run_id']}").json()
+    assert [t for t in stored_r1["plan"]["tasks"] if t["node_id"] == "AI-ABSTRACT-CONSISTENCY"][0]["status"] == "failed"
+    assert len(stored_r1["decisions"]) == 1
+
+    # 3. 已成功后再次同配置提交：保持幂等复用 r2
+    r3 = client.post("/reviews?journal=general-medical-cn", data={"llm_config": llm_cfg}, files=files).json()
+    assert r3["run_id"] == r2["run_id"]
+
+
+def test_r02_ai_citation_scope_truncation_mismatch_ambiguity_and_cross_evidence(tmp_path: Path, monkeypatch):
+    """R02 回归：越过送审章节、截断边界外、指定段落不匹配、位置歧义均拦截；跨摘要与正文多处证据均核验并保存。"""
+    _stub_public_dns(monkeypatch)
+    captured: list[dict] = []
+
+    long_tail_prefix = "观测结果平稳。" * 3500  # 使长块尾段超过 24,000 字符截断阈值
+
+    def _resp(req: httpx.Request, body: dict):
+        items = [
+            # 1) 章节外（讨论段未纳入 AI-ABSTRACT-CONSISTENCY 的 applies_to）
+            {
+                "blockId": "P0006",
+                "originalText": "讨论段独有句子不应过检",
+                "description": "越界章节引文",
+                "suggestion": "修改",
+                "severity": "warning",
+            },
+            # 2) 截断边界外（位于 P0004 的 24k 截断线之后）
+            {
+                "blockId": "P0004",
+                "originalText": "超截断尾句不可见",
+                "description": "截断边界外引文",
+                "suggestion": "修改",
+                "severity": "warning",
+            },
+            # 3) 指定段落不匹配（引文在结果段 P0003，但 model 声称在 P0002）
+            {
+                "blockId": "P0002",
+                "originalText": "结果独有指标数值",
+                "description": "指定段落张冠李戴",
+                "suggestion": "修改",
+                "severity": "warning",
+            },
+            # 4) 位置歧义（未指定段落，短语在送审范围出现两次）
+            {
+                "originalText": "重复患者百例",
+                "description": "歧义匹配测试",
+                "suggestion": "修改",
+                "severity": "warning",
+            },
+            # 5) 合法跨摘要与正文对照证据（主锚点在摘要 P0002，次证据在结果 P0003）
+            {
+                "blockId": "P0002",
+                "originalText": "摘要有效率80%",
+                "evidenceAnchors": [{"blockId": "P0003", "originalText": "结果有效率65%"}],
+                "description": "摘要与结果段有效率不一致",
+                "suggestion": "核对前后有效率",
+                "severity": "error",
+            },
+        ]
+        return 200, {"choices": [{"message": {"content": json.dumps({"findings": items}, ensure_ascii=False)}}]}
+
+    factory = _mock_client_factory(captured, _resp)
+    client = TestClient(create_app(db_path=tmp_path / "r02.sqlite3", llm_client_factory=factory))
+
+    raw = make_docx_bytes(
+        [
+            "R02 送审范围门禁测试",
+            "摘要：纳入重复患者百例，摘要有效率80%。",
+            "1 结果\n结果独有指标数值，结果有效率65%，纳入重复患者百例。",
+            f"2 结果详述：{long_tail_prefix}超截断尾句不可见。",
+            "3 讨论",
+            "讨论段独有句子不应过检。",
+        ]
+    )
+    res = client.post(
+        "/reviews?journal=general-medical-cn",
+        data={
+            "llm_config": json.dumps(
+                {
+                    "enabled": True,
+                    "provider": "openai",
+                    "api_key": "sk-k1",
+                    "model": "gpt-4o-mini",
+                    "enabled_rules": ["AI-ABSTRACT-CONSISTENCY"],
+                }
+            )
+        },
+        files={"file": ("r02.docx", raw, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    assert res.status_code == 200
+    run = res.json()
+
+    # 检查发往模型的 prompt 确实不包含讨论段与超截断尾句
+    sent_prompt = captured[0]["body"]["messages"][1]["content"]
+    assert "讨论段独有句子不应过检" not in sent_prompt
+    assert "超截断尾句不可见" not in sent_prompt
+
+    # 仅有跨摘要-结果合法意见通过门禁，且保留经核验的 secondary_anchors
+    ai_ok = [f for f in run["findings"] if f["source_type"] == "ai_candidate"]
+    assert len(ai_ok) == 1
+    assert ai_ok[0]["anchor"]["quote"] == "摘要有效率80%"
+    assert len(ai_ok[0]["secondary_anchors"]) == 1
+    assert ai_ok[0]["secondary_anchors"][0]["quote"] == "结果有效率65%"
+    assert "_sent_spans" not in ai_ok[0]["evidence"]
+
+    # 4 条不合格响应均进入带明确原因的 rejected_candidates
+    rej = run["rejected_candidates"]
+    assert len(rej) == 4
+    reasons_joined = "\n".join(item["reason"] for item in rej)
+    assert "超出" in reasons_joined or "送审" in reasons_joined
+    assert "截断" in reasons_joined
+    assert "不匹配" in reasons_joined
+    assert "歧义" in reasons_joined
+
+
+def test_r07_production_endpoint_dns_ssrf_guard(tmp_path: Path, monkeypatch):
+    """R07 回归：真实或恶意非公网 DNS 解析（如 198.18.0.1 Fake-IP 或内网 IP）在端点预检阶段被阻断。"""
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", int(port or 443)))
+        ],
+    )
+    client = TestClient(create_app(db_path=tmp_path / "r07.sqlite3"))
+    res = client.post(
+        "/llm/test",
+        json={
+            "enabled": True,
+            "provider": "openai",
+            "api_key": "sk-user",
+            "model": "gpt-4o-mini",
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["ok"] is False
+    assert "SSRF" in data["message"] or "非公网" in data["message"]

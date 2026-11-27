@@ -238,7 +238,7 @@ def parse_docx_bytes(raw_bytes: bytes, filename: str = "manuscript.docx") -> Doc
                     runs=item["runs"],
                     excluded_spans=[tuple(sp) for sp in item.get("excluded_spans", [])],
                     exclude_entire=bool(item.get("exclude_entire", False)),
-                    meta=item.get("meta", {}),
+                    meta={**(item.get("meta") or {}), "style": item.get("style", "")},
                 )
             )
 

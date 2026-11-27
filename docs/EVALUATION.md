@@ -20,9 +20,9 @@
 3. **边界 (Boundary)**：如 `P=0` / `P=1`、四舍五入容差边界、`2020-2025` 年份豁免；
 4. **例外 (Exception)**：如引号内示例句、“血压高于”“人流量”上下文豁免、正文提及“见图9”不误判为题注。
 
-## 3. 历史回归与当前实测基线（2026-11-26）
+## 3. 历史回归与当前实测基线（2026-11-27）
 
-- **本平台自动化测试（`.venv/bin/python -m pytest -v`，Python 3.12.13）**：实测 **35/35 全部通过**，覆盖 `DocumentIR` 安全解析与锚点、Knowledge/Registry/Router DAG、P 值/百分比/题注/复用规则正反边界例外、规则文档无损往返与重启保持、ReDoS 花括号量词与 `regex` 超时熔断、`advanced_params` 校验、流式上传限额与 ZIP 炸弹拦截、Bearer RBAC 鉴权与前端会话令牌栏、同段多批注 Word 导出、受控大模型（OpenAI/Claude/自定义兼容接口）并行执行与锚点/幻觉拦截门禁、服务端密钥严格同源同 provider 绑定、SSRF 防线（CGNAT/IPv4 映射地址阻断、DNS 解析 IP 固定防重绑定、`REVIEW_LLM_LOCAL_ALLOWLIST` 精确白名单与错误脱敏）、LLM 维度幂等键、长稿与短段多块带前缀 24,000 字截断结构化元数据披露、乐观并发裁决、综合报告导出及 CLI 全流程。
+- **本平台自动化测试（`.venv/bin/python -m pytest -v`，Python 3.12.13）**：实测 **42/42 全部通过**，覆盖 `DocumentIR` 安全解析与前后端 Unicode 码点坐标一致（含前置 emoji/扩展汉字）、Knowledge/Registry/Router DAG、全角 `Ｐ值＝１．２` / 严格不等式 `P<0` / `P=.03` / 带量词百分比 `30/100 例（40%）` / 负分子 `−1/3(33%)` / 无样式正文图引用识别与保留排除原因、整段模式 `whole_line` 匹配与例外校验、规则文档无损往返与重启保持、ReDoS 花括号量词与 `regex` 超时熔断、`advanced_params` 校验、流式上传限额与 ZIP 炸弹拦截、Bearer RBAC 鉴权与前端会话令牌栏、同段多批注 Word 导出、受控大模型（OpenAI/Claude/自定义兼容接口）并行执行与送审章节/截断/段落/歧义及跨段证据门禁、失败重试槽位分配与首轮记录/裁决保留、服务端密钥严格同源同 provider 绑定、SSRF 防线（CGNAT/IPv4 映射地址阻断、DNS 解析 IP 固定防重绑定、`REVIEW_LLM_LOCAL_ALLOWLIST` 精确白名单与错误脱敏、离线 DNS 测试隔离）、LLM 维度幂等键、长稿与短段多块 24,000 字截断披露、wheel 安装包文档正文完整性、乐观并发裁决、综合报告导出及 CLI 全流程。
 - **历史基线核对（未改动原仓库）**：
   - `medical-journal-copyediting-2.0.0`：`scripts/tests/run_tests.py` 实测 `25/25` 通过（`F1=1.000`）。
   - `medical-journal-reviewer`：`npm test`（Vitest）实测 9 个文件 `95/95` 通过，`npm run build` 构建通过。

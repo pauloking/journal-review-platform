@@ -5,6 +5,14 @@ from __future__ import annotations
 import re
 
 
+_NUM_TRANS = str.maketrans("０１２３４５６７８９．＋－−ｅＥ", "0123456789.+--eE")
+
+
+def normalize_numeric_text(text: str) -> str:
+    """将全角数字/小数点/正负号/Unicode减号规范化为 ASCII 数值字符串（仅用于计算，不改动原文坐标）。"""
+    return text.translate(_NUM_TRANS)
+
+
 def is_reference_entry(text: str) -> bool:
     """识别带编号或不带编号的中英文文后参考文献条目。"""
     clean = text.strip()

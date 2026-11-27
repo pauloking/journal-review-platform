@@ -121,7 +121,13 @@ class KnowledgeEngine:
 
         for entry in BUILTIN_DOC_MANIFEST:
             md_path = docs_dir / entry["file"]
-            body_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+            if not md_path.exists():
+                raise RuntimeError(
+                    f"内置规范文档资源缺失: {md_path}（请检查知识包完整性与打包配置）"
+                )
+            body_md = md_path.read_text(encoding="utf-8")
+            if not body_md.strip():
+                raise RuntimeError(f"内置规范文档正文为空: {md_path}")
             primary_clause = self._clauses[entry["basis_id"]]
             doc = KnowledgeDocument(
                 doc_id=entry["doc_id"],

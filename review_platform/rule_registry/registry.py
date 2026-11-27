@@ -132,8 +132,6 @@ def validate_maintainable_rule(rule: MaintainableTermRule, *, is_builtin_trusted
                 return False
             if excl_compiled and excl_compiled.search(text, timeout=REGEX_MATCH_TIMEOUT_SEC):
                 return False
-            if whole_line:
-                return bool(text.strip())
             for m in compiled.finditer(text, timeout=REGEX_MATCH_TIMEOUT_SEC):
                 start, end = m.start(), m.end()
                 if skip_if_year and m.lastindex and m.lastindex >= 2:

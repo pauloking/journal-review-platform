@@ -447,3 +447,143 @@ def test_n10_shared_reference_entry_helper_used():
     from review_platform.document_engine import text_utils
 
     assert legacy_structure._is_reference_entry is text_utils.is_reference_entry
+
+
+def test_r03_knowledge_pack_markdown_complete_and_missing_raises(tmp_path: Path):
+    """R03 回归：全部内置规范文档正文非空，导出包含正文；缺失知识包文档文件显式报错。"""
+    import pytest
+    import shutil
+    from review_platform.knowledge_engine.store import DEFAULT_PACK_DIR, KnowledgeEngine
+
+    client = TestClient(create_app(db_path=tmp_path / "r03.sqlite3"))
+    docs = client.get("/registry").json()["documents"]
+    assert len(docs) == 10
+    for d in docs:
+        assert d["body_markdown"].strip(), f"{d['doc_id']} 正文为空"
+        exp = client.get(f"/knowledge/documents/{d['doc_id']}/export")
+        assert exp.status_code == 200
+        assert d["body_markdown"].strip().splitlines()[0] in exp.text
+
+    broken_pack = tmp_path / "broken_pack"
+    shutil.copytree(DEFAULT_PACK_DIR, broken_pack)
+    next((broken_pack / "documents").glob("*.md")).unlink()
+    with pytest.raises(RuntimeError, match="内置规范文档资源缺失"):
+        KnowledgeEngine(pack_dir=broken_pack)
+
+
+def test_r04_basic_rules_fullwidth_strict_ineq_pct_unit_neg_and_prose_caption(tmp_path: Path):
+    """R04 回归：全角 P 值、严格不等式 P<0、P=.03、带量词百分比、负分子与无样式正文图引用识别与排除原因。"""
+    from docx import Document
+
+    buf = io.BytesIO()
+    doc = Document()
+    doc.add_paragraph("R04 基础规则回归稿件")
+    doc.add_paragraph(
+        "摘要：全角异常 Ｐ值＝１．２，无解不等式 P<0 与 P>1，合法边界 P=.03、P=0、P=1。"
+        "百分比异常 30/100 例（40%），负分子 −1/3(33%)。"
+    )
+    doc.add_paragraph("1 结果")
+    p_cap1 = doc.add_paragraph("图1 基线特征图")
+    p_cap1.style = "Caption"
+    doc.add_paragraph("图2 显示组间变化。")
+    doc.add_paragraph("图2 后续完整随访曲线")
+    doc.save(buf)
+
+    client = TestClient(create_app(db_path=tmp_path / "r04.sqlite3"))
+    run = client.post(
+        "/reviews?journal=general-medical-cn",
+        files={"file": ("r04.docx", buf.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    ).json()
+
+    p_facts = [f for f in run["facts"] if f["kind"] == "p_value"]
+    p_fact_quotes = {f["anchor"]["quote"] for f in p_facts}
+    assert "Ｐ值＝１．２" in p_fact_quotes
+    assert "P=.03" in p_fact_quotes
+
+    p_findings = [f for f in run["findings"] if f["rule_id"] == "STAT-PRANGE"]
+    p_hit_quotes = {f["anchor"]["quote"] for f in p_findings}
+    assert {"Ｐ值＝１．２", "P<0", "P>1"}.issubset(p_hit_quotes)
+    assert "P=.03" not in p_hit_quotes
+    assert "P=0" not in p_hit_quotes
+    assert "P=1" not in p_hit_quotes
+
+    # 原文切片锚点保留全角原文
+    fw = next(f for f in p_findings if f["anchor"]["quote"] == "Ｐ值＝１．２")
+    blk_text = next(b["text"] for b in run["document"]["blocks"] if b["id"] == fw["anchor"]["block_id"])
+    assert blk_text[fw["anchor"]["start"] : fw["anchor"]["end"]] == "Ｐ值＝１．２"
+
+    pct_findings = [f for f in run["findings"] if f["rule_id"] == "DATA-PCT-RECALC"]
+    pct_quotes = {f["anchor"]["quote"] for f in pct_findings}
+    assert "30/100 例（40%）" in pct_quotes
+    assert "−1/3(33%)" in pct_quotes
+
+    # 「图2 显示组间变化。」被排除并保留排除原因，因此真题注「图2 后续完整随访曲线」不会误报跳号/重复
+    cap_facts = [f for f in run["facts"] if f["kind"] == "caption"]
+    excluded_prose = [f for f in cap_facts if f["exclusion_reason"] == "body_prose_caption_reference"]
+    assert len(excluded_prose) == 1
+    assert [f for f in run["findings"] if f["rule_id"] == "STRUCT-CAPTION-SEQ"] == []
+
+
+def test_r05_whole_line_rule_respects_pattern_and_exemptions(tmp_path: Path):
+    """R05 回归：整段模式先校验匹配条件与例外再以整段输出引文，注册与运行时行为一致。"""
+    client = TestClient(create_app(db_path=tmp_path / "r05.sqlite3"))
+
+    save_res = client.post(
+        "/knowledge/documents",
+        json={
+            "title": "R05 整段模式测试规范",
+            "source": "本刊体例",
+            "edition": "2026",
+            "scope": "journal",
+            "summary": "测试 whole_line 模式确实校验 pattern",
+            "body_markdown": "# R05 整段模式规范",
+            "rules": [
+                {
+                    "rule_id": "R05-WHOLE-01",
+                    "nonstandard": "绝对有效",
+                    "standard": "改为客观统计学描述",
+                    "severity": "warning",
+                    "is_regex": False,
+                    "example": "本方案宣称绝对有效。",
+                    "counter_example": "本方案观察组缓解率高于对照组。",
+                    "description": "禁用绝对化表述（整段标记）",
+                    "advanced_params": {"whole_line": True},
+                }
+            ],
+        },
+    )
+    assert save_res.status_code == 200
+
+    paras = [f"正常医学段落第{i}段。" for i in range(1, 8)] + ["结论：该疗法绝对有效。"]
+    raw = make_docx_bytes(paras)
+    run = client.post(
+        "/reviews?journal=general-medical-cn",
+        files={"file": ("r05.docx", raw, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    ).json()
+
+    hits = [f for f in run["findings"] if f["rule_id"] == "R05-WHOLE-01"]
+    assert len(hits) == 1
+    assert hits[0]["anchor"]["quote"] == "结论：该疗法绝对有效。"
+
+
+def test_r06_codepoint_anchor_and_frontend_utf16_slicing(tmp_path: Path):
+    """R06 回归：前置 emoji/扩展汉字场景下前后端 Unicode 码点坐标一致。"""
+    client = TestClient(create_app(db_path=tmp_path / "r06.sqlite3"))
+    raw = make_docx_bytes(["🙂P=1.2。", "𠮷P=1.5。"])
+    run = client.post(
+        "/reviews?journal=general-medical-cn",
+        files={"file": ("r06.docx", raw, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    ).json()
+
+    p_hits = [f for f in run["findings"] if f["rule_id"] == "STAT-PRANGE"]
+    assert len(p_hits) == 2
+    assert p_hits[0]["anchor"]["start"] == 1
+    assert p_hits[0]["anchor"]["end"] == 6
+    assert p_hits[0]["anchor"]["quote"] == "P=1.2"
+    assert p_hits[1]["anchor"]["start"] == 1
+    assert p_hits[1]["anchor"]["end"] == 6
+    assert p_hits[1]["anchor"]["quote"] == "P=1.5"
+
+    app_js = client.get("/static/app.js").text
+    assert "sliceByCodePoints" in app_js
+    assert "Array.from(String(text" in app_js

@@ -674,50 +674,120 @@ def test_llm_connection(
         )
 
 
+def _find_text_occurrences(haystack: str, needle: str) -> list[tuple[int, int, str]]:
+    if not needle:
+        return []
+    hits: list[tuple[int, int, str]] = []
+    start = 0
+    while True:
+        idx = haystack.find(needle, start)
+        if idx < 0:
+            break
+        hits.append((idx, idx + len(needle), needle))
+        start = idx + 1
+    return hits
+
+
+def _match_quote_variants(haystack: str, clean_q: str) -> list[tuple[int, int, str]]:
+    hits = _find_text_occurrences(haystack, clean_q)
+    if hits:
+        return hits
+    stripped = clean_q.strip("“”‘’\"'「」")
+    if len(stripped) >= 2 and stripped != clean_q:
+        return _find_text_occurrences(haystack, stripped)
+    return []
+
+
 def _locate_quote_anchor(
     document: DocumentIR,
     block_hint: str,
     quote: str,
-) -> Anchor:
-    """在 DocumentIR 中逐字定位 AI 返回的 originalText；找不到则返回未命中锚点供门禁拦截。"""
+    *,
+    sent_spans: Optional[dict[str, tuple[int, int]]] = None,
+) -> tuple[Anchor, Optional[str]]:
+    """在送审区间内逐字定位引文；对越界、截断外、指定段落不匹配与歧义返回明确拦截原因。"""
     clean_q = quote.strip()
-    if clean_q and len(clean_q) >= 2:
-        blocks = list(document.blocks)
-        if block_hint:
-            hinted = [b for b in blocks if b.id == block_hint]
-            blocks = hinted + [b for b in blocks if b.id != block_hint]
-        for blk in blocks:
-            idx = blk.text.find(clean_q)
-            if idx >= 0:
-                return Anchor(
-                    document_id=document.document_id,
-                    block_id=blk.id,
-                    start=idx,
-                    end=idx + len(clean_q),
-                    quote=clean_q,
-                )
-        # 去除模型外层可能自加的引号后再次精确匹配（不压缩内部空白）
-        stripped = clean_q.strip("“”‘’\"'「」")
-        if len(stripped) >= 2 and stripped != clean_q:
-            for blk in blocks:
-                idx = blk.text.find(stripped)
-                if idx >= 0:
-                    return Anchor(
-                        document_id=document.document_id,
-                        block_id=blk.id,
-                        start=idx,
-                        end=idx + len(stripped),
-                        quote=stripped,
-                    )
-
     fallback_block = document.blocks[0].id if document.blocks else "P0001"
-    return Anchor(
-        document_id=document.document_id,
-        block_id=block_hint or fallback_block,
-        start=0,
-        end=0,
-        quote=clean_q or "(未提供原文引文)",
-    )
+
+    def _fail(reason: str, blk_id: str = "") -> tuple[Anchor, str]:
+        return (
+            Anchor(
+                document_id=document.document_id,
+                block_id=blk_id or block_hint or fallback_block,
+                start=0,
+                end=0,
+                quote=clean_q or "(未提供原文引文)",
+            ),
+            reason,
+        )
+
+    if len(clean_q) < 2:
+        return _fail("引文过短或为空，无法逐字核验")
+
+    blocks_by_id = {b.id: b for b in document.blocks}
+    active_spans = sent_spans if sent_spans is not None else {
+        b.id: (0, len(b.text)) for b in document.blocks if b.kind != "separator"
+    }
+
+    if block_hint:
+        blk = blocks_by_id.get(block_hint)
+        if blk is None:
+            return _fail(f"指定段落不存在: {block_hint}")
+        if block_hint not in active_spans:
+            return _fail(f"指定段落超出送审章节或已被截断: {block_hint}")
+        s_start, s_end = active_spans[block_hint]
+        all_hits = _match_quote_variants(blk.text, clean_q)
+        if not all_hits:
+            return _fail(f"指定段落 {block_hint} 中未匹配到引文（指定段落不匹配）")
+        in_scope = [(s, e, q) for (s, e, q) in all_hits if s >= s_start and e <= s_end]
+        if not in_scope:
+            return _fail(f"引文超出 {block_hint} 的 24,000 字符截断边界，未送入模型")
+        if len(in_scope) > 1:
+            return _fail(f"引文在 {block_hint} 内出现 {len(in_scope)} 次，存在位置歧义")
+        s, e, q = in_scope[0]
+        return (
+            Anchor(
+                document_id=document.document_id,
+                block_id=blk.id,
+                start=s,
+                end=e,
+                quote=q,
+            ),
+            None,
+        )
+
+    in_scope_hits: list[tuple[str, int, int, str]] = []
+    saw_trunc_outside = False
+    for blk in document.blocks:
+        if blk.id not in active_spans:
+            continue
+        s_start, s_end = active_spans[blk.id]
+        for s, e, q in _match_quote_variants(blk.text, clean_q):
+            if s >= s_start and e <= s_end:
+                in_scope_hits.append((blk.id, s, e, q))
+            else:
+                saw_trunc_outside = True
+
+    if len(in_scope_hits) == 1:
+        b_id, s, e, q = in_scope_hits[0]
+        return (
+            Anchor(
+                document_id=document.document_id,
+                block_id=b_id,
+                start=s,
+                end=e,
+                quote=q,
+            ),
+            None,
+        )
+    if len(in_scope_hits) > 1:
+        return _fail(f"未指定段落且引文在送审范围内匹配到 {len(in_scope_hits)} 处，存在位置歧义")
+    if saw_trunc_outside:
+        return _fail("引文位于 24,000 字符截断边界之外，未送入模型")
+    for blk in document.blocks:
+        if blk.id not in active_spans and _match_quote_variants(blk.text, clean_q):
+            return _fail("引文仅存在于送审范围之外的章节或被截断段落")
+    return _fail("送审范围内未找到逐字匹配引文")
 
 
 @dataclass
@@ -758,13 +828,26 @@ def run_semantic_rule_with_llm(
             target_blocks=0,
         )
 
-    manuscript_lines = [f"[{b.id} | {b.section_cn}] {b.text}" for b in target_blocks]
+    prompt_budget = 24000
+    sent_spans: dict[str, tuple[int, int]] = {}
+    manuscript_lines: list[str] = []
+    cur_pos = 0
+    for blk in target_blocks:
+        prefix = f"[{blk.id} | {blk.section_cn}] "
+        line = f"{prefix}{blk.text}"
+        manuscript_lines.append(line)
+        text_start = cur_pos + len(prefix)
+        included_len = min(len(blk.text), max(0, prompt_budget - text_start))
+        if included_len > 0:
+            sent_spans[blk.id] = (0, included_len)
+        cur_pos += len(line) + 1
+
     manuscript_text = "\n".join(manuscript_lines)
     input_chars = len(manuscript_text)
-    context_truncated = input_chars > 24000
+    context_truncated = input_chars > prompt_budget
     # 防止超长稿件撑爆单次上下文，保守截断到约 24000 字符并显式标记
     if context_truncated:
-        manuscript_text = manuscript_text[:24000] + "\n…（后续内容超出单次模型上下文预算已截断）"
+        manuscript_text = manuscript_text[:prompt_budget] + "\n…（后续内容超出单次模型上下文预算已截断）"
 
     dimension_guide = RULE_INSTRUCTIONS.get(rule.id, rule.message_template)
     user_prompt = (
@@ -778,6 +861,7 @@ def run_semantic_rule_with_llm(
         "    {\n"
         '      "blockId": "段落编号，如 P0002",\n'
         '      "originalText": "必须从下方文本块中逐字连续复制的有问题原文片段（不要包含[P0002|...]前缀，不要改写）",\n'
+        '      "evidenceAnchors": [{"blockId": "可选关联证据段落编号", "originalText": "可选跨段对照原文片段"}],\n'
         '      "description": "具体问题描述",\n'
         '      "suggestion": "修改建议（严禁擅自捏造或篡改科研数据）",\n'
         '      "reason": "审校理由",\n'
@@ -817,7 +901,39 @@ def run_semantic_rule_with_llm(
 
         orig_text = str(item.get("originalText") or item.get("quote") or "").strip()
         block_hint = str(item.get("blockId") or item.get("block_id") or "").strip()
-        anchor = _locate_quote_anchor(document, block_hint, orig_text)
+        anchor, scope_err = _locate_quote_anchor(
+            document,
+            block_hint,
+            orig_text,
+            sent_spans=sent_spans,
+        )
+
+        # 解析跨位置关联对照证据（如摘要 vs 正文结果段），同样严格核验送审边界
+        secondary_anchors: list[Anchor] = []
+        raw_extra = item.get("evidenceAnchors") or item.get("anchors") or []
+        extra_pairs: list[tuple[str, str]] = []
+        if isinstance(raw_extra, list):
+            for ex in raw_extra:
+                if isinstance(ex, dict):
+                    ex_q = str(ex.get("originalText") or ex.get("quote") or "").strip()
+                    ex_b = str(ex.get("blockId") or ex.get("block_id") or "").strip()
+                    if ex_q:
+                        extra_pairs.append((ex_b, ex_q))
+        cmp_q = str(item.get("evidenceText") or item.get("compareText") or "").strip()
+        cmp_b = str(item.get("evidenceBlockId") or item.get("compareBlockId") or "").strip()
+        if cmp_q:
+            extra_pairs.append((cmp_b, cmp_q))
+
+        for ex_b, ex_q in extra_pairs:
+            sec_anchor, sec_err = _locate_quote_anchor(
+                document,
+                ex_b,
+                ex_q,
+                sent_spans=sent_spans,
+            )
+            if sec_err is not None and scope_err is None:
+                scope_err = f"关联对照证据核验失败: {sec_err}"
+            secondary_anchors.append(sec_anchor)
 
         sev = str(item.get("severity") or rule.severity).lower()
         if sev not in ("error", "warning", "info"):
@@ -825,6 +941,18 @@ def run_semantic_rule_with_llm(
 
         raw_id = f"{rule.id}:{anchor.block_id}:{anchor.start}:{anchor.end}:{anchor.quote}:{idx}".encode("utf-8")
         fid = f"ai-{hashlib.sha256(raw_id).hexdigest()[:12]}"
+
+        ev: dict[str, Any] = {
+            "provider": config.provider,
+            "model": config.model,
+            "reason": str(item.get("reason") or "").strip(),
+            "block_hint": block_hint,
+            "context_truncated": context_truncated,
+            "secondary_evidence_count": len(secondary_anchors),
+            "_sent_spans": sent_spans,
+        }
+        if scope_err:
+            ev["_scope_error"] = scope_err
 
         findings.append(
             Finding(
@@ -838,16 +966,11 @@ def run_semantic_rule_with_llm(
                 scope=rule.scope,
                 severity=sev,  # type: ignore[arg-type]
                 anchor=anchor,
+                secondary_anchors=secondary_anchors,
                 fact_ids=[],
                 message=desc or rule.message_template,
                 suggestion=sugg or rule.suggestion_template,
-                evidence={
-                    "provider": config.provider,
-                    "model": config.model,
-                    "reason": str(item.get("reason") or "").strip(),
-                    "block_hint": block_hint,
-                    "context_truncated": context_truncated,
-                },
+                evidence=ev,
                 source_type="ai_candidate",
                 verification=AnchorVerification(anchor_valid=False, basis_valid=False, reason="pending"),
             )

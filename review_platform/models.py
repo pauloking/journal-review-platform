@@ -291,6 +291,7 @@ class Finding(BaseModel):
     scope: ScopeType
     severity: SeverityType
     anchor: Anchor
+    secondary_anchors: list[Anchor] = Field(default_factory=list)
     fact_ids: list[str] = Field(default_factory=list)
     message: str
     suggestion: str
@@ -355,6 +356,7 @@ class ReviewRun(BaseModel):
     """单次审校运行的完整可追溯快照。"""
 
     run_id: str
+    retry_of: Optional[str] = None
     created_at: str
     engine_version: str
     status: Literal["completed", "complete_with_limitations", "failed"]

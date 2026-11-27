@@ -9,6 +9,7 @@ from typing import Callable, Optional
 
 import httpx
 
+from review_platform.document_engine.text_utils import normalize_numeric_text
 from review_platform.knowledge_engine import KnowledgeEngine
 from review_platform.models import (
     Anchor,
@@ -59,14 +60,24 @@ def _validate_p_range(
             continue
         checked += 1
         raw_val = str(fact.values.get("raw_value", ""))
+        norm_val = normalize_numeric_text(raw_val)
+        op = str(fact.values.get("operator", "="))
         try:
-            val = Decimal(raw_val)
+            val = Decimal(norm_val)
         except InvalidOperation:
             continue
-        if val < Decimal("0") or val > Decimal("1"):
+        strict_infeasible = (op in ("<", "＜") and val == Decimal("0")) or (
+            op in (">", "＞") and val == Decimal("1")
+        )
+        if val < Decimal("0") or val > Decimal("1") or strict_infeasible:
+            msg = (
+                f"严格不等式「{fact.anchor.quote}」在概率区间 [0, 1] 内无解"
+                if strict_infeasible
+                else f"报告数值「{fact.anchor.quote}」对应的 P={norm_val} 超出概率区间 [0, 1]"
+            )
             findings.append(
                 Finding(
-                    id=_stable_finding_id(rule_id, fact.anchor, raw_val),
+                    id=_stable_finding_id(rule_id, fact.anchor, f"{op}{norm_val}"),
                     rule_id=rule_id,
                     rule_version="1.0.0",
                     basis_id=basis_id,
@@ -77,10 +88,12 @@ def _validate_p_range(
                     severity="error",
                     anchor=fact.anchor,
                     fact_ids=[fact.id],
-                    message=f"报告数值「{fact.anchor.quote}」对应的 P={raw_val} 超出概率区间 [0, 1]",
+                    message=msg,
                     suggestion="请编辑核实原始统计输出与小数点位置（严禁自动篡改数据）",
                     evidence={
                         "raw_value": raw_val,
+                        "normalized_value": norm_val,
+                        "operator": op,
                         "valid_interval": "[0, 1]",
                         "section": fact.scope,
                     },
@@ -113,9 +126,9 @@ def _validate_percentage(
             excluded += 1
             continue
         checked += 1
-        n_str = str(fact.values.get("numerator", "0"))
-        N_str = str(fact.values.get("denominator", "0"))
-        rep_str = str(fact.values.get("reported_pct", "0"))
+        n_str = normalize_numeric_text(str(fact.values.get("numerator", "0")))
+        N_str = normalize_numeric_text(str(fact.values.get("denominator", "0")))
+        rep_str = normalize_numeric_text(str(fact.values.get("reported_pct", "0")))
 
         try:
             n_val = Decimal(n_str)
@@ -140,6 +153,29 @@ def _validate_percentage(
                     fact_ids=[fact.id],
                     message=f"百分比分母 N={N_str} 无效（不能为 0 或负数）：「{fact.anchor.quote}」",
                     suggestion="请编辑核实总例数 N 与原始数据记录",
+                    evidence={"n": n_str, "N": N_str, "reported_pct": rep_str},
+                    source_type="deterministic",
+                    verification=AnchorVerification(anchor_valid=False, basis_valid=False, reason="pending"),
+                )
+            )
+            continue
+
+        if n_val < 0:
+            findings.append(
+                Finding(
+                    id=_stable_finding_id(rule_id, fact.anchor, "neg_num"),
+                    rule_id=rule_id,
+                    rule_version="1.0.0",
+                    basis_id=basis_id,
+                    basis_source=basis_source,
+                    title="频数百分比 n/N(pct%) 精确复算校验",
+                    category="data",
+                    scope="professional",
+                    severity="error",
+                    anchor=fact.anchor,
+                    fact_ids=[fact.id],
+                    message=f"分子 n={n_str} 为负数，超出频数有效范围 [0, {N_str}]：「{fact.anchor.quote}」",
+                    suggestion="请编辑核实原始分子数据及负号是否误录",
                     evidence={"n": n_str, "N": N_str, "reported_pct": rep_str},
                     source_type="deterministic",
                     verification=AnchorVerification(anchor_valid=False, basis_valid=False, reason="pending"),

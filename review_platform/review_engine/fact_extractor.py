@@ -8,14 +8,18 @@ import re
 from review_platform.models import Anchor, Block, DocumentIR, Fact
 
 P_VALUE_RE = re.compile(
-    r"(?<![A-Za-z0-9_])([PpＰ])\s*([=＝<＜>＞≤≥])\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+    r"(?<![A-Za-z0-9_])([PpＰｐ])(?:\s*值)?\s*([=＝<＜>＞≤≥])\s*([+\-−－]?[0-9０-９]*(?:[.．][0-9０-９]+|[0-9０-９]+)(?:[eEｅＥ][+\-−－]?[0-9０-９]+)?)"
 )
 
 PCT_RE = re.compile(
-    r"(?<!\d)(\d+)\s*/\s*(\d+)\s*[（(]\s*([+-]?\d+(?:\.\d+)?)\s*[%％]\s*[)）]"
+    r"(?<![0-9０-９.])([+\-−－]?[0-9０-９]+)\s*/\s*([0-9０-９]+)(?:\s*(?:例(?:患者)?|人|名|次|个|份|株))?\s*[（(]\s*([+\-−－]?[0-9０-９]+(?:[.．][0-9０-９]+)?)\s*[%％]\s*[)）]"
 )
 
 CAPTION_RE = re.compile(r"^\s*(图|表)\s*(\d+)(?=\s|[:：.．]|$)")
+_CAPTION_STYLE_RE = re.compile(r"caption|题注|图题|表题", re.I)
+_PROSE_CAPTION_TAIL_RE = re.compile(
+    r"^(?:显示|表明|提示|可见|说明|示意|示|反映|呈现|证实|证明|列出|比较了|所示|如下|为|是|中|内)"
+)
 
 
 def _in_excluded_span(block: Block, start: int, end: int) -> str | None:
@@ -95,13 +99,21 @@ def extract_facts(doc: DocumentIR) -> list[Fact]:
                 )
             )
 
-        # 3. 段首图表题注抽取（表格单元格与参考文献区不计为题注）
+        # 3. 段首图表题注抽取（表格单元格与参考文献区不计为题注；无题注样式的正文语境保留排除痕迹）
         if block.kind not in {"table_cell", "reference", "separator"}:
             cm = CAPTION_RE.match(text)
             if cm:
                 start, end = cm.start(1), cm.end(2)
                 quote = text[start:end]
                 excl = _in_excluded_span(block, start, end)
+                if excl is None:
+                    style = str((block.meta or {}).get("style", ""))
+                    has_caption_style = bool(_CAPTION_STYLE_RE.search(style))
+                    tail = text[cm.end(2) :].strip()
+                    if not has_caption_style and tail and (
+                        _PROSE_CAPTION_TAIL_RE.match(tail) or tail.endswith(("。", "！", "？", "；"))
+                    ):
+                        excl = "body_prose_caption_reference"
                 facts.append(
                     Fact(
                         id=_fact_id("caption", block.id, start, end, quote),

@@ -507,6 +507,17 @@ function renderPipelineVisualization() {
   </table>`;
 }
 
+function sliceByCodePoints(text, start, end) {
+  const cps = Array.from(String(text || ''));
+  const s = Math.max(0, Math.min(cps.length, Number(start) || 0));
+  const e = Math.max(s, Math.min(cps.length, Number(end) || 0));
+  return {
+    before: cps.slice(0, s).join(''),
+    mid: cps.slice(s, e).join(''),
+    after: cps.slice(e).join(''),
+  };
+}
+
 function renderDocumentBlocks() {
   const wrap = document.getElementById('doc-blocks');
   wrap.innerHTML = currentRun.document.blocks
@@ -514,12 +525,8 @@ function renderDocumentBlocks() {
       const isTarget = selectedAnchor && selectedAnchor.block_id === b.id;
       let htmlText = esc(b.text);
       if (isTarget) {
-        const s = selectedAnchor.start;
-        const e = selectedAnchor.end;
-        const before = esc(b.text.slice(0, s));
-        const mid = esc(b.text.slice(s, e));
-        const after = esc(b.text.slice(e));
-        htmlText = `${before}<mark class="quote-hl">${mid}</mark>${after}`;
+        const seg = sliceByCodePoints(b.text, selectedAnchor.start, selectedAnchor.end);
+        htmlText = `${esc(seg.before)}<mark class="quote-hl">${esc(seg.mid)}</mark>${esc(seg.after)}`;
       }
       return `<div class="doc-block ${isTarget ? 'active-block' : ''}" id="block-${esc(b.id)}">
         <div class="block-meta">[${esc(b.id)}] ${esc(b.section_cn)} (${esc(b.kind)})</div>

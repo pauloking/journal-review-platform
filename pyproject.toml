@@ -29,7 +29,7 @@ test = [
 include = ["review_platform*"]
 
 [tool.setuptools.package-data]
-review_platform = ["knowledge_packs/**/*.json", "static/*"]
+review_platform = ["knowledge_packs/**/*.json", "knowledge_packs/**/*.md", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -92,31 +92,63 @@ class ReviewStore:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
 
+    @staticmethod
+    def _has_failed_tasks(run: ReviewRun) -> bool:
+        return run.status == "failed" or any(t.status == "failed" for t in run.plan.tasks)
+
     def save_run(self, run: ReviewRun) -> ReviewRun:
-        """保存或复用同一 run_id 快照，原子幂等且绝不覆盖已有裁决历史。"""
-        payload = run.model_copy(update={"decisions": []}).model_dump_json()
+        """保存运行快照：成功记录保持幂等复用且绝不覆盖裁决；若前次存在失败节点则保留原失败记录并分配重试槽位。"""
+        base_id = run.run_id
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO review_runs (
-                    run_id, created_at, document_id, journal_id,
-                    journal_version, rule_snapshot_hash, status, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(run_id) DO NOTHING
-                """,
-                (
-                    run.run_id,
-                    run.created_at,
-                    run.document.document_id,
-                    run.journal.id,
-                    run.journal.version,
-                    run.plan.rule_snapshot_hash,
-                    run.status,
-                    payload,
-                ),
-            )
-            conn.commit()
-        return self.get_run(run.run_id)
+            conn.execute("BEGIN IMMEDIATE")
+            candidate_id = base_id
+            prev_id: str | None = None
+            attempt = 1
+            while True:
+                row = conn.execute(
+                    "SELECT payload_json FROM review_runs WHERE run_id = ?",
+                    (candidate_id,),
+                ).fetchone()
+                if row is None:
+                    to_save = run.model_copy(
+                        update={
+                            "run_id": candidate_id,
+                            "retry_of": prev_id,
+                            "decisions": [],
+                        }
+                    )
+                    payload = to_save.model_dump_json()
+                    conn.execute(
+                        """
+                        INSERT INTO review_runs (
+                            run_id, created_at, document_id, journal_id,
+                            journal_version, rule_snapshot_hash, status, payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            to_save.run_id,
+                            to_save.created_at,
+                            to_save.document.document_id,
+                            to_save.journal.id,
+                            to_save.journal.version,
+                            to_save.plan.rule_snapshot_hash,
+                            to_save.status,
+                            payload,
+                        ),
+                    )
+                    conn.commit()
+                    break
+
+                existing = ReviewRun.model_validate_json(row["payload_json"])
+                if not self._has_failed_tasks(existing):
+                    conn.rollback()
+                    return self.get_run(candidate_id)
+
+                prev_id = candidate_id
+                attempt += 1
+                candidate_id = f"{base_id}-r{attempt}"
+
+        return self.get_run(candidate_id)
 
     def get_run(self, run_id: str) -> ReviewRun:
         with self._connect() as conn:

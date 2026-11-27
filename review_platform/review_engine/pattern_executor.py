@@ -142,20 +142,21 @@ def execute_pattern_rule(
 
         text = block.text
         if whole_line:
-            checked += 1
-            if _in_excluded_span(block, 0, len(text)):
-                excluded += 1
-                continue
-            if params.get("ref_only") and not (
-                block.section == "references" and _is_reference_entry(text)
-            ):
-                excluded += 1
-                continue
-            excl_pat = params.get("exclude_pattern")
-            if excl_pat and regex.search(excl_pat, text, timeout=REGEX_MATCH_TIMEOUT_SEC):
-                continue
             if not text.strip():
                 continue
+            m = compiled.search(text, timeout=REGEX_MATCH_TIMEOUT_SEC)
+            if m is None:
+                continue
+            checked += 1
+            reason = _should_skip_match(rule, block, m, text)
+            if reason:
+                excluded += 1
+                continue
+            if dedupe_key:
+                if dedupe_key in dedupe_seen:
+                    excluded += 1
+                    continue
+                dedupe_seen.add(dedupe_key)
             quote = text.strip()
             start = text.find(quote)
             end = start + len(quote)
